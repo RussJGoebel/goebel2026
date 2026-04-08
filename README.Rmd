@@ -1,0 +1,362 @@
+---
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  fig.width = 8,
+  fig.height = 5,
+  warning   = FALSE,
+  message   = FALSE
+)
+```
+
+```{r pkgs}
+library(fastblm)
+library(spatintegrate)
+library(goebel2026)
+library(Matrix)
+library(sf)
+library(ggplot2)
+library(patchwork)
+
+set.seed(42)
+```
+
+## Preview
+
+The model fit looks like this, and in this demo we'll build the pieces and show how to tune parameters:
+
+```{r eval = FALSE}
+fit_aug <- fastblm::fit_fastblm(
+  y      = y_alb,
+  A      = A_aug,
+  Q      = Q_aug,
+  phi    = phi_aug,
+  solver = "cholesky"
+)
+```
+
+
+## Data
+
+### Projected sf observations / target
+
+
+```{r projected}
+# Ensures each dataset is the same projected-coordinates before computing area-intersections
+soundings_proj <- spatintegrate::ensure_projected(goebel2026::soundings_augmented)
+target_proj    <- spatintegrate::ensure_projected(goebel2026::target_grid)
+
+```
+
+### A-matrix construction using spatintegrate
+
+```{r Amatrix}
+
+A <- as(
+  spatintegrate::compute_overlap_fractions(soundings_proj, target_proj),
+  "dgCMatrix"
+)
+
+p <- ncol(A)
+
+```
+
+### Observation-vector simulation
+
+```{r observation-vector}
+truth <- goebel2026::target_grid$mean_albedo
+
+# Raw upscaled
+# y_alb <- goebel2026::soundings_augmented$mean_albedo +
+#   rnorm(length(goebel2026::soundings_augmented$mean_albedo),
+#         0, noise_sd)
+
+# Upscale with A matrix
+noise_sd <- sd(goebel2026::target_grid$mean_albedo, na.rm = TRUE) / 20
+
+y_alb <- A %*% truth +
+  rnorm(length(goebel2026::soundings_augmented$mean_albedo),
+        0, noise_sd)
+
+```
+
+## Covariates
+
+```{r covariates}
+water_sounding <- goebel2026::soundings_augmented$proportion_water
+X_fixed <- cbind(intercept = 1, water = water_sounding)
+q       <- ncol(X_fixed)
+
+water_grid_p <- goebel2026::target_grid$proportion_water
+water_grid_p[is.na(water_grid_p)] <- 0
+
+X_grid <- cbind(intercept = 1, water = water_grid_p)
+```
+
+
+
+## Intrinsic SAR Prior (ρ = 1)
+
+Setting ρ = 1 gives an intrinsic SAR prior: Q = (I − W)ᵀ(I − W) is positive
+semi-definite (singular). K\_aug is still invertible because AᵀA regularises
+the system in the observed directions. Because Q is singular its log-determinant
+is undefined; we use `log_det_Q = 0` as a convention (improper prior) — it is a
+constant that cancels out of the φ optimum.
+
+```{r Q}
+
+W <- goebel2026::make_W_matrix(goebel2026::target_grid)
+
+rho_fixed <- 1.0
+IminusW   <- Matrix::Diagonal(nrow(W)) - rho_fixed * W
+Q_fixed   <- Matrix::forceSymmetric(Matrix::crossprod(IminusW))
+Q_fixed   <- Matrix::drop0(Q_fixed)
+
+cat(sprintf("Q fixed at rho=1: p=%d  nnz=%d\n", nrow(Q_fixed), nnzero(Q_fixed)))
+```
+
+## Tune φ via CV
+
+```{r tune}
+lambda_beta <- 0.01
+
+A_aug <- as(cbind(A, X_fixed), "dgCMatrix")
+
+Q_aug_fun <- function(theta) {
+  Q_aug     <- Matrix::bdiag(Q_fixed, lambda_beta * Matrix::Diagonal(q))
+  log_det_Q <- q * log(lambda_beta)
+  list(Q = Q_aug, log_det_Q = log_det_Q)
+}
+
+tuned_cv_rho1 <- tune_cv(
+  y          = y_alb,
+  A          = A_aug,
+  Q_fun      = Q_aug_fun,
+  theta_init = numeric(0), # providing theta_init will 
+ # X_cov      = X_fixed,
+  k          = 5L,
+  verbose    = TRUE
+)
+
+# ML alternative (faster, no cross-validation):
+# tuned_ml_rho1 <- tune_ml(
+#   y          = y_alb,
+#   A          = A_aug,
+#   Q_fun      = Q_aug_fun,
+#   X_fixed    = NULL,
+#   theta_init = numeric(0),
+#   verbose    = TRUE
+# )
+```
+
+## Fit
+
+```{r fit}
+phi_aug <- tuned_cv_rho1$phi
+print(phi_aug)
+
+Q_aug <- Matrix::bdiag(
+  Q_fixed,
+  lambda_beta / phi_aug * Matrix::Diagonal(q)
+)
+
+fit_aug <- fastblm::fit_fastblm(
+  y      = y_alb,
+  A      = A_aug,
+  Q      = Q_aug,
+  phi    = phi_aug,
+  solver = "cholesky"
+)
+
+r_hat    <- fit_aug$posterior_mean[seq_len(p)]
+beta_hat <- fit_aug$posterior_mean[p + seq_len(q)]
+
+cat(sprintf("beta_hat: intercept=%.4f  water=%.4f\n", beta_hat[1], beta_hat[2]))
+
+se_aug  <- fastblm::posterior_se(fit_aug)
+se_r    <- se_aug[seq_len(p)]
+se_beta <- se_aug[p + seq_len(q)]
+
+cat(sprintf("se_beta:  intercept=%.4f  water=%.4f\n", se_beta[1], se_beta[2]))
+
+# A_pred maps [r; beta] -> r + X_grid %*% beta, i.e. full grid-level prediction
+A_pred  <- as(cbind(Matrix::Diagonal(p), X_grid), "dgCMatrix")
+pred    <- as.vector(A_pred %*% fit_aug$posterior_mean)
+se_pred <- fastblm::posterior_se(fit_aug, A_new = A_pred)
+```
+
+## RSR Constraint
+
+```{r rsr}
+C_spatial   <- as.matrix(t(X_fixed) %*% A)
+C_aug       <- cbind(C_spatial, matrix(0, q, q))
+
+fit_aug_rsr <- fastblm::constrain(fit_aug, C_aug)
+
+r_hat_rsr    <- fit_aug_rsr$posterior_mean[seq_len(p)]
+beta_hat_rsr <- fit_aug_rsr$posterior_mean[p + seq_len(q)]
+
+cat(sprintf("RSR beta_hat: intercept=%.4f  water=%.4f\n",
+            beta_hat_rsr[1], beta_hat_rsr[2]))
+cat(sprintf("RSR ||C r||_inf = %.2e\n", max(abs(C_spatial %*% r_hat_rsr))))
+
+# Sanity check on C Sigma C' conditioning
+SigmaCt_rsr  <- fit_aug_rsr$constraint$SigmaCt
+CSigmaCt_rsr <- as.matrix(C_aug) %*% as.matrix(SigmaCt_rsr)
+cat(sprintf("C Sigma C' eigenvalues: %s\n",
+            paste(formatC(eigen(CSigmaCt_rsr)$values, format = "e", digits = 3),
+                  collapse = ", ")))
+
+pred_rsr    <- as.vector(A_pred %*% fit_aug_rsr$posterior_mean)
+se_pred_rsr <- fastblm::posterior_se(fit_aug_rsr, A_new = A_pred)
+```
+
+## Evaluation
+
+```{r metrics}
+# Restrict to cells covered by at least one sounding footprint -- unobserved
+# cells are pure prior smoothing and shouldn't count toward predictive metrics.
+observed_cells <- colSums(A) > 0
+
+eval_metrics <- function(label, pred, se, truth) {
+  keep  <- observed_cells & !is.na(truth)
+  resid <- pred[keep] - truth[keep]
+  rmse     <- sqrt(mean(resid^2))
+  r2       <- 1 - sum(resid^2) / sum((truth[keep] - mean(truth[keep]))^2)
+  coverage <- mean(truth[keep] >= pred[keep] - 1.96 * se[keep] &
+                   truth[keep] <= pred[keep] + 1.96 * se[keep])
+  cat(sprintf("%-22s  RMSE=%.4f  R2=%.4f  95%%cov=%.1f%%  (n=%d cells)\n",
+              label, rmse, r2, 100 * coverage, sum(keep)))
+  data.frame(Model = label, RMSE = rmse, R2 = r2, Coverage = coverage)
+}
+
+met_base <- eval_metrics("Unconstrained",   pred,     se_pred,     truth)
+met_rsr  <- eval_metrics("RSR-constrained", pred_rsr, se_pred_rsr, truth)
+
+knitr::kable(rbind(met_base, met_rsr), digits = 4, row.names = FALSE,
+             col.names = c("Model", "RMSE", "R²", "95% Coverage"))
+```
+
+## Plots
+
+```{r plot-setup, include=FALSE}
+plot_sf <- target_proj
+plot_sf$truth     <- truth
+plot_sf$water     <- water_grid_p
+plot_sf$r_hat     <- pred
+plot_sf$r_hat_rsr <- pred_rsr
+plot_sf$se        <- se_pred
+plot_sf$se_rsr    <- se_pred_rsr
+plot_sf$resid     <- pred     - truth
+plot_sf$resid_rsr <- pred_rsr - truth
+plot_sf$cov_base  <- !is.na(truth) &
+                     truth >= pred     - 1.96 * se_pred &
+                     truth <= pred     + 1.96 * se_pred
+plot_sf$cov_rsr   <- !is.na(truth) &
+                     truth >= pred_rsr - 1.96 * se_pred_rsr &
+                     truth <= pred_rsr + 1.96 * se_pred_rsr
+
+sf_plot <- function(data, fill, title,
+                    lo = "#2c7bb6", mi = "#ffffbf", hi = "#d7191c",
+                    midpt = NULL, lims = NULL) {
+  if (is.null(midpt)) midpt <- mean(data[[fill]], na.rm = TRUE)
+  ggplot(data) +
+    geom_sf(aes(fill = .data[[fill]]), colour = NA) +
+    scale_fill_gradient2(low = lo, mid = mi, high = hi,
+                         midpoint = midpt, limits = lims,
+                         na.value = "grey90", name = NULL) +
+    labs(title = title) +
+    theme_void(base_size = 10) +
+    theme(plot.title = element_text(face = "bold", size = 10),
+          legend.key.height = unit(0.5, "cm"))
+}
+
+lim_alb <- range(c(truth, r_hat, r_hat_rsr), na.rm = TRUE)
+lim_se  <- range(c(se_pred, se_pred_rsr),    na.rm = TRUE)
+lim_res <- max(abs(c(plot_sf$resid, plot_sf$resid_rsr)), na.rm = TRUE) * c(-1, 1)
+```
+
+### True field and water covariate
+
+```{r plot-truth, fig.height=4}
+sf_plot(plot_sf, "truth", "True albedo", lims = lim_alb, midpt = mean(lim_alb)) |
+sf_plot(plot_sf, "water", "Water fraction",
+        lo = "#f7fbff", mi = "#6baed6", hi = "#08306b", midpt = 0.25)
+```
+
+### Fitted fields
+
+```{r plot-fits, fig.height=4}
+(sf_plot(plot_sf, "r_hat",     "Posterior mean — unconstrained",
+         lims = lim_alb, midpt = mean(lim_alb)) |
+ sf_plot(plot_sf, "r_hat_rsr", "Posterior mean — RSR",
+         lims = lim_alb, midpt = mean(lim_alb))) +
+  plot_annotation(title = sprintf("phi = %.4f", phi_aug))
+```
+
+### Posterior SE
+
+```{r plot-se, fig.height=4}
+sf_plot(plot_sf, "se",    "SE — unconstrained",
+        lo = "#fff7ec", mi = "#fc8d59", hi = "#7f0000",
+        midpt = mean(lim_se), lims = lim_se) |
+sf_plot(plot_sf, "se_rsr", "SE — RSR",
+        lo = "#fff7ec", mi = "#fc8d59", hi = "#7f0000",
+        midpt = mean(lim_se), lims = lim_se)
+```
+
+### Residuals
+
+```{r plot-resid, fig.height=4}
+sf_plot(plot_sf, "resid",     "Residual — unconstrained", lims = lim_res, midpt = 0) |
+sf_plot(plot_sf, "resid_rsr", "Residual — RSR",           lims = lim_res, midpt = 0)
+```
+
+### Predicted vs. true
+
+```{r scatter, fig.height=4}
+keep  <- !is.na(truth)
+sc_df <- data.frame(
+  truth  = rep(truth[keep], 2),
+  fitted = c(pred[keep], pred_rsr[keep]),
+  model  = rep(c("Unconstrained", "RSR"), each = sum(keep))
+)
+
+ggplot(sc_df, aes(truth, fitted)) +
+  geom_point(aes(colour = model), alpha = 0.3, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_colour_manual(values = c("Unconstrained" = "steelblue", "RSR" = "tomato"),
+                      guide = "none") +
+  facet_wrap(~ model) +
+  labs(title = "Predicted vs. true albedo", x = "True", y = "Posterior mean") +
+  theme_minimal(base_size = 13)
+```
+
+### 95% coverage
+
+```{r coverage-map, fig.height=4}
+cov_sf <- rbind(
+  st_sf(covered = plot_sf$cov_base, model = "Unconstrained", geometry = st_geometry(plot_sf)),
+  st_sf(covered = plot_sf$cov_rsr,  model = "RSR",           geometry = st_geometry(plot_sf))
+)
+
+ggplot(cov_sf) +
+  geom_sf(aes(fill = covered), colour = NA) +
+  scale_fill_manual(values  = c("TRUE" = "#d9f0d3", "FALSE" = "#e9a3c9"),
+                    labels  = c("TRUE" = "Covered", "FALSE" = "Not covered"),
+                    na.value = "grey90", name = NULL) +
+  facet_wrap(~ model) +
+  labs(title = "95% posterior credible interval coverage") +
+  theme_void(base_size = 13)
+```
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
+
