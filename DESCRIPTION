@@ -11,3 +11,5 @@ RoxygenNote: 7.3.3
 Depends: 
     R (>= 3.5)
 LazyData: true
+URL: https://github.com/RussJGoebel/goebel2026
+BugReports: https://github.com/RussJGoebel/goebel2026/issues
