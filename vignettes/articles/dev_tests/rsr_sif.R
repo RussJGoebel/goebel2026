@@ -32,6 +32,8 @@ A <- as(
 p <- ncol(A)
 W <- goebel2026::make_W_matrix(goebel2026::target_grid)
 
+Rinv <- Matrix::diag(1/soundings_augmented$SIF_Uncertainty_757nm)
+
 # =============================================================================
 # 2. Covariates
 # =============================================================================
@@ -76,7 +78,8 @@ tuned <- tune_cv(
   A          = A_aug,
   Q_fun      = Q_aug_fun,
   theta_init = numeric(0),
-  X_cov      = X_fixed,
+  #X_cov      = X_fixed,
+  R_inv = Rinv,
   k          = 5L,
   verbose    = TRUE
 )
@@ -99,6 +102,7 @@ fit_base <- fastblm::fit_fastblm(
   A      = A_aug,
   Q      = Q_aug,
   phi    = phi_aug,
+  R_inv = Rinv,
   solver = "cholesky"
 )
 

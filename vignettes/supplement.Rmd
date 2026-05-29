@@ -1,0 +1,604 @@
+---
+title: "Supplementary Materials: Bayesian Downscaling of Satellite-Derived Solar-Induced Chlorophyll Fluorescence"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: pdflatex
+    keep_tex: false
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{amsmath}
+  - \usepackage{caption}
+  - \captionsetup{font=small}
+  - \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.pos   = "H",
+  out.width = "\\textwidth"
+)
+
+library(goebel2026)
+library(fastblm)
+library(Matrix)
+library(ggplot2)
+library(patchwork)
+library(sf)
+library(knitr)
+# library(kableExtra) -- removed: requires multirow.sty not available on cluster
+
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
+load_result <- function(nm) {
+  env <- new.env(parent = emptyenv())
+  tryCatch(
+    data(list = nm, package = "goebel2026", envir = env),
+    warning = function(w) NULL, error = function(e) NULL
+  )
+  env[[nm]]
+}
+
+expand_to_grid <- function(vals, idx, n) {
+  out <- rep(NA_real_, n)
+  out[idx] <- vals
+  out
+}
+
+d_shared   <- goebel2026::setup_shared
+d_sif      <- goebel2026::setup_sif
+target_sf  <- goebel2026::target_grid
+target_idx <- which(target_sf$n_intersects > 0)
+n_grid     <- nrow(target_sf)
+```
+
+\newpage
+
+# Water Covariate and Spatial Confounding in SIF Downscaling {#sec:water}
+
+## Motivation
+
+SIF over open water is expected to be near zero, as photosynthesis does not
+occur on water surfaces. This expectation is consistent with lower raw SIF
+values in OCO-2 soundings whose footprints overlap with the Charles River
+and Boston Harbour. Including water proportion as a covariate allows the
+model to account for this mean difference explicitly.
+
+However, including a spatially structured covariate alongside a spatial
+random effect introduces spatial confounding (Hodges and Reich 2010): the
+model may explain spatial variation through either the covariate coefficient
+$\beta$ or the residual field $r^{(\ell)}$, making inference on $\beta$
+unreliable. We document the problem and two solutions: hard restricted
+spatial regression (RSR) and a soft penalty variant.
+
+## Naive fit: unconstrained covariate
+
+Without the RSR constraint, the spatial random effect and the water
+covariate share explanatory power. Table \ref{tab:betas-naive} shows
+$\hat\beta$ estimates under unconstrained models.
+
+```{r betas-naive}
+res_naive <- load_result("results_sif_rsr")
+res_rho1  <- load_result("results_sif_rsr_rho1")
+res_wz    <- load_result("results_sif_water_zero")
+
+rows <- list(
+  list(res_naive, "Water covariate, no RSR, $\\rho$ free"),
+  list(res_rho1,  "Water covariate, no RSR, $\\rho=1$"),
+  list(res_wz,    "Water zero constraint")
+)
+
+beta_df <- do.call(rbind, lapply(rows, function(x) {
+  r <- x[[1]]; nm <- x[[2]]
+  if (is.null(r) || is.null(r$beta_hat)) return(NULL)
+  data.frame(Model     = nm,
+             Intercept = round(r$beta_hat[1], 3),
+             Water     = round(r$beta_hat[2], 3),
+             rho       = round(r$rho_opt %||% 1, 3),
+             phi       = round(r$phi, 3),
+             stringsAsFactors = FALSE)
+}))
+
+if (!is.null(beta_df) && nrow(beta_df) > 0) {
+  kable(beta_df, format = "latex", booktabs = TRUE, escape = FALSE,
+        caption = paste0("Estimated covariate coefficients under naive (no RSR) models. ",
+                         "The intercept estimates mean SIF over non-water pixels; ",
+                         "the water coefficient estimates the offset for water pixels. ",
+                         "Positive or near-zero water coefficients are inconsistent ",
+                         "with the physical expectation that water SIF $\\approx 0$."),
+        label = "betas-naive")
+} else {
+  cat("Naive SIF results not available.")
+}
+```
+
+In the unconstrained model, the spatial random effect absorbs covariate
+variation. The water coefficient is not reliably interpretable because the
+model can explain the same data either through $\beta$ or through the
+spatial field, depending on the smoothing parameter. When $\phi$ is large
+(strong smoothing), more variation is attributed to the spatial field and
+the covariate coefficient is compressed toward zero; when $\phi$ is small,
+the covariate absorbs more variation. This instability is the signature of
+spatial confounding.
+
+## RSR: enforcing orthogonality
+
+The RSR constraint
+$$
+X^{(o)\top} A r^{(\ell)} = 0
+$$
+ensures that the spatial component cannot explain variation collinear with
+the covariate. Under this constraint, $\hat\beta$ equals the coefficient
+that would be obtained if the model were fitted without a spatial random
+effect at all, and is therefore interpretable as the pure water-effect
+estimate. Table \ref{tab:betas-rsr} shows $\hat\beta$ under RSR-constrained
+models.
+
+```{r betas-rsr}
+res_rsr_rho1  <- load_result("results_sif_rsr_rho1")
+res_canonical <- load_result("results_sif_canonical")
+res_softrsr   <- load_result("results_softrsr_albedo")
+
+rows_rsr <- list(
+  list(res_rsr_rho1,  "Hard RSR, $\\rho=1$"),
+  list(res_canonical, "Hard RSR + $R^{-1}$, $\\rho=1$ (canonical)"),
+  list(res_softrsr,   "Soft RSR penalty")
+)
+
+beta_rsr_df <- do.call(rbind, lapply(rows_rsr, function(x) {
+  r <- x[[1]]; nm <- x[[2]]
+  if (is.null(r) || is.null(r$beta_hat)) return(NULL)
+  data.frame(Model     = nm,
+             Intercept = round(r$beta_hat[1], 3),
+             Water     = round(r$beta_hat[2], 3),
+             rho       = round(r$rho_opt %||% 1, 3),
+             phi       = round(r$phi, 3),
+             stringsAsFactors = FALSE)
+}))
+
+if (!is.null(beta_rsr_df) && nrow(beta_rsr_df) > 0) {
+  kable(beta_rsr_df, format = "latex", booktabs = TRUE, escape = FALSE,
+        caption = paste0("Estimated covariate coefficients under RSR-constrained models. ",
+                         "The water coefficient is now negative and physically consistent: ",
+                         "the model assigns lower SIF to water pixels, ",
+                         "consistent with near-zero photosynthetic activity over water."),
+        label = "betas-rsr")
+} else {
+  cat("RSR SIF results not available.")
+}
+```
+
+Under RSR, the water coefficient is negative and of plausible magnitude,
+consistent with the prior expectation from the literature and with lower
+raw SIF values observed over water soundings. The intercept estimates mean
+SIF for vegetated pixels, which is also consistent with typical SIF values
+for the Boston region in summer.
+
+## Why not simply exclude water pixels?
+
+One alternative is to set $\beta_\text{water} = 0$ and exclude water pixels
+from contributing to covariate adjustment. The difficulty is that this
+requires the spatial prior to account for all variation at land-water
+boundaries without any covariate information. With limited sounding coverage
+over water, the prior dominates in those pixels and boundary artefacts can
+appear. RSR uses the covariate to explain the land-water mean difference and
+reserves the spatial prior for residual variation, which makes better use of
+the available information.
+
+## Soft RSR penalty
+
+Hard RSR enforces the orthogonality constraint exactly. A soft alternative
+penalises departures from orthogonality with a scale parameter $\lambda$:
+
+$$
+\text{penalty}(\lambda) = \frac{\lambda}{2} \| X^{(o)\top} A r^{(\ell)} \|^2.
+$$
+
+When $\lambda \to \infty$ this recovers hard RSR; when $\lambda = 0$ the
+constraint is absent. Cross-validation over a grid of $\lambda$ values
+selects a moderately penalised solution.
+
+```{r soft-rsr-plot, fig.cap="Cross-validation MSE surface for the soft RSR penalty parameter $\\alpha$ at four values of $\\rho$. Each curve shows the CV MSE as a function of $\\log\\alpha$; the selected value (star) prefers moderate penalisation between the unconstrained ($\\alpha\\to 0$) and hard-RSR ($\\alpha\\to\\infty$) extremes.", fig.height=3}
+if (!is.null(res_softrsr) && !is.null(res_softrsr$grid)) {
+  g <- res_softrsr$grid
+  g$rho_label <- factor(sprintf("rho=%.2f", g$rho))
+  best <- g[which.min(g$cv_mse), ]
+
+  ggplot(g, aes(x = log_alpha, y = cv_mse, colour = rho_label)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(data = best, shape = 8, size = 3, colour = "black") +
+    scale_colour_brewer(palette = "RdYlBu", name = expression(rho)) +
+    labs(x     = expression(log~alpha),
+         y     = "CV MSE",
+         title = "Soft RSR: CV surface over penalty scale") +
+    theme_minimal(base_size = 10)
+} else {
+  plot.new()
+  text(0.5, 0.5, "Soft RSR results not available.\nRun soft RSR script first.", cex = 1)
+}
+```
+
+\newpage
+
+# Landcover-Aware Neighbourhood Weights {#sec:neighbors}
+
+## Motivation
+
+The standard SAR prior uses queen adjacency with equal weights, treating
+all edges between neighbouring pixels symmetrically. An alternative is to
+reduce weights on edges crossing land-water boundaries, on the grounds that
+SIF is expected to vary more sharply at such interfaces. We evaluated four
+neighbourhood variants alongside the standard queen adjacency baseline:
+rook adjacency (no diagonal neighbours), land-cover downweighted queen
+adjacency, and two parameterisations of cross-boundary weight reduction.
+
+## Results
+
+```{r neighbor-table}
+res_base    <- load_result("results_water_rsr_rho1")
+res_rook    <- load_result("results_neighbor_rook")
+res_lc      <- load_result("results_neighbor_lc")
+res_lc_eps  <- load_result("results_neighbor_lc_eps")
+res_lc_alph <- load_result("results_neighbor_lc_alpha")
+
+rows_nb <- list(
+  list(res_base,    "Queen, equal weights (baseline)"),
+  list(res_rook,    "Rook, equal weights"),
+  list(res_lc,      "Queen + LC downweight"),
+  list(res_lc_eps,  "Queen + LC $\\epsilon$-weight"),
+  list(res_lc_alph, "Queen + LC $\\alpha$-weight")
+)
+
+nb_df <- do.call(rbind, lapply(rows_nb, function(x) {
+  r <- x[[1]]; nm <- x[[2]]
+  if (is.null(r)) return(NULL)
+  data.frame(Model    = nm,
+             phi      = round(r$phi, 3),
+             tau      = round(1/r$phi, 2),
+             RMSE     = round(r$rmse %||% NA_real_, 5),
+             R2       = round(r$r2   %||% NA_real_, 4),
+             Coverage = round(r$coverage_95_obs %||% NA_real_, 4),
+             stringsAsFactors = FALSE)
+}))
+
+if (!is.null(nb_df) && nrow(nb_df) > 0) {
+  kable(nb_df, format = "latex", booktabs = TRUE, escape = FALSE,
+        caption = paste0("Predictive performance under alternative neighbourhood weight schemes ",
+                         "on the semi-synthetic albedo data. Differences in RMSE and R$^2$ ",
+                         "are small across all variants, suggesting that once water proportion ",
+                         "is included as a covariate, the specific neighbourhood structure ",
+                         "has limited additional impact."),
+        label = "neighbor-table")
+} else {
+  cat("Neighbour weight results not available.")
+}
+```
+
+```{r neighbor-maps, fig.cap="Posterior mean albedo under equal-weight queen adjacency (left) and landcover-downweighted adjacency (right). Spatial patterns are nearly indistinguishable, confirming that the water covariate absorbs most of the boundary information.", fig.height=3.5}
+if (!is.null(res_base) && !is.null(res_lc) &&
+    !is.null(res_base$posterior_mean) && !is.null(res_lc$posterior_mean)) {
+  target_sf$val_base <- expand_to_grid(res_base$posterior_mean, target_idx, n_grid)
+  target_sf$val_lc   <- expand_to_grid(res_lc$posterior_mean,   target_idx, n_grid)
+  lims <- range(c(target_sf$val_base, target_sf$val_lc), na.rm = TRUE)
+
+  p1 <- ggplot(target_sf) +
+    geom_sf(aes(fill = val_base), colour = NA) +
+    scale_fill_viridis_c(limits = lims, na.value = "grey90", name = "Albedo") +
+    labs(title = "Queen (equal weights)") +
+    theme_minimal(base_size = 9) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          axis.title = element_blank(), panel.grid = element_blank())
+
+  p2 <- ggplot(target_sf) +
+    geom_sf(aes(fill = val_lc), colour = NA) +
+    scale_fill_viridis_c(limits = lims, na.value = "grey90", name = "Albedo") +
+    labs(title = "Queen + LC downweight") +
+    theme_minimal(base_size = 9) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          axis.title = element_blank(), panel.grid = element_blank())
+
+  print(p1 | p2)
+} else {
+  plot.new()
+  text(0.5, 0.5, "Neighbour posterior results not available.", cex = 1)
+}
+```
+
+The landcover-aware weights produce negligible improvement in predictive
+performance on the albedo data. This is consistent with the expectation
+that, once water proportion is included as a covariate, the model already
+accounts for the mean difference between land and water pixels; the
+neighbourhood structure then affects only residual spatial smoothing, which
+is relatively insensitive to land-water boundaries once the covariate is
+present. On this basis, we use equal-weight queen adjacency as the primary
+neighbourhood specification.
+
+\newpage
+
+# Forward Operator Sensitivity {#sec:gA}
+
+## Motivation
+
+The primary analysis uses a uniform area-intersection forward operator,
+treating all parts of a sounding footprint as equally informative. The
+OCO-2 sensor response may in practice taper toward footprint edges,
+motivating a Gaussian-weighted alternative:
+$$
+A_{ij} \;\propto\; \int_{D^{(o)}_i \cap D^{(\ell)}_j} g_i(s)\,\mathrm{d}s,
+$$
+where $g_i$ is an affine-mapped isotropic Gaussian with scale $\tau$ in
+canonical $[-1,1]^2$ footprint space. The value $\tau = 1/3$ places the
+footprint edge at approximately one standard deviation.
+
+Since the true OCO-2 sensor response function for target-mode retrievals is
+not precisely known, and since $\tau$ cannot be tuned without ground truth,
+we treat this as a sensitivity analysis rather than an alternative primary
+model.
+
+## 2x2 contingency experiment
+
+We generated synthetic albedo observations under each forward operator
+and fitted under each forward operator, yielding a $2\times2$ contingency
+table. Diagonal cells are correctly specified; off-diagonal cells are
+misspecified.
+
+```{r contingency-table}
+r_uu <- load_result("results_contingency_uu")
+r_ug <- load_result("results_contingency_ug")
+r_gu <- load_result("results_contingency_gu")
+r_gg <- load_result("results_contingency_gg")
+
+if (!any(sapply(list(r_uu, r_ug, r_gu, r_gg), is.null))) {
+  cont_df <- data.frame(
+    `Generating $A$` = c("Uniform", "Uniform", "Gaussian", "Gaussian"),
+    `Fitting $A$`    = c("Uniform", "Gaussian", "Uniform", "Gaussian"),
+    RMSE = round(c(r_uu$rmse, r_ug$rmse, r_gu$rmse, r_gg$rmse), 5),
+    `$R^2$` = round(c(r_uu$r2, r_ug$r2, r_gu$r2, r_gg$r2), 4),
+    phi  = round(c(r_uu$tuned$phi, r_ug$tuned$phi,
+                   r_gu$tuned$phi, r_gg$tuned$phi), 3),
+    check.names = FALSE
+  )
+  kable(cont_df, format = "latex", booktabs = TRUE, escape = FALSE,
+        caption = paste0("$2\\times 2$ contingency table comparing generating vs fitting ",
+                         "forward operator on semi-synthetic albedo data. ",
+                         "Diagonal entries (correctly specified) outperform off-diagonal ",
+                         "entries (misspecified). Misspecification is asymmetric: ",
+                         "fitting uniform $A$ to Gaussian-generated data (RMSE ",
+                         round(r_gu$rmse, 5), ") is worse than the reverse (",
+                         round(r_ug$rmse, 5), "), ",
+                         "because the Gaussian operator concentrates mass near footprint ",
+                         "centres, making uniform averaging a poorer approximation."),
+        label = "contingency")
+} else {
+  cat("Contingency results not yet available. Run run_g_A_contingency.R first.")
+}
+```
+
+The correctly specified diagonal entries outperform both off-diagonal
+entries. Because $\tau$ cannot be estimated without ground truth, and
+because the uniform operator is validated under the semi-synthetic
+experiment, we retain the uniform forward operator as the primary model.
+
+\newpage
+
+# Hyperparameter Tuning: Cross-Validation, Spatial Blocking, and Maximum Likelihood {#sec:tuning}
+
+## Overview
+
+The smoothing parameter $\tau = 1/\phi$ is selected by 10-fold
+cross-validation (CV) minimising held-out prediction error. This section
+examines two alternative tuning approaches — spatially blocked CV and
+marginal maximum likelihood (ML) — and explains why random CV is preferred.
+
+## Spatial blocking
+
+```{r block-map, fig.cap="Spatial fold assignments for the blocked cross-validation experiment. Ten geographically contiguous blocks were formed by $k$-means clustering of sounding centroids.", fig.height=4}
+blocked_folds <- d_sif$blocked_folds %||% goebel2026::setup_albedo$blocked_folds
+soundings_sf  <- d_shared$soundings_proj
+
+if (!is.null(blocked_folds) && !is.null(soundings_sf)) {
+  soundings_sf$block <- factor(blocked_folds)
+  ggplot(soundings_sf) +
+    geom_sf(aes(fill = block), colour = NA, alpha = 0.85) +
+    scale_fill_brewer(palette = "Paired", name = "Block") +
+    labs(title = "Spatially blocked CV folds ($k$-means, $k=10$)") +
+    theme_minimal(base_size = 9) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          panel.grid = element_blank())
+} else {
+  plot.new(); text(0.5, 0.5, "blocked_folds not available", cex = 1)
+}
+```
+
+```{r blocking-table}
+res_cv_alb  <- load_result("results_water_rho1")
+res_blk_alb <- load_result("results_cv_blocked")
+res_cv_sif  <- load_result("results_sif_canonical")
+res_blk_sif <- load_result("results_sif_cv_blocked")
+
+rows_blk <- list(
+  list(res_cv_alb,  "Albedo", "Random CV"),
+  list(res_blk_alb, "Albedo", "Blocked CV"),
+  list(res_cv_sif,  "SIF",    "Random CV"),
+  list(res_blk_sif, "SIF",    "Blocked CV")
+)
+
+blk_df <- do.call(rbind, lapply(rows_blk, function(x) {
+  r <- x[[1]]; ds <- x[[2]]; mt <- x[[3]]
+  if (is.null(r)) return(NULL)
+  data.frame(Dataset  = ds,
+             Method   = mt,
+             phi      = round(r$phi, 4),
+             tau      = round(1/r$phi, 2),
+             RMSE     = round(r$rmse %||% NA_real_, 5),
+             `$R^2$`  = round(r$r2   %||% NA_real_, 4),
+             check.names = FALSE,
+             stringsAsFactors = FALSE)
+}))
+
+if (!is.null(blk_df) && nrow(blk_df) > 0) {
+  kable(blk_df, format = "latex", booktabs = TRUE, escape = FALSE,
+        caption = paste0("Smoothing parameter selected by random vs spatially blocked CV. ",
+                         "Blocked CV selects substantially smaller $\\phi$ (stronger smoothing) ",
+                         "on both datasets, with the discrepancy approximately $14\\times$ ",
+                         "for albedo and $55\\times$ for SIF."),
+        label = "blocking-table")
+} else {
+  cat("Blocking results not available.")
+}
+```
+
+Spatially blocked CV selects much smaller $\phi$ than random CV on both
+datasets. This reflects the OCO-2 target-mode observation geometry: sounding
+footprints overlap densely in the central domain, so any geographic
+partition creates train-test splits with radically different overlap
+densities. In a held-out block, the spatial prior cannot extrapolate across
+the gap from training soundings, so the CV objective provides no gradient
+favouring smoothing and $\phi$ collapses toward zero.
+
+The standard justification for spatial blocking — preventing autocorrelation
+leakage between training and test folds — does not apply to this model.
+There is no spatial noise term: spatial structure enters only through the
+SAR prior, which is integrated out. Leakage between folds is therefore not
+a concern, and random CV is the appropriate evaluation criterion.
+
+## ML vs CV: likelihood surface analysis
+
+Figure \ref{fig:likelihood-surface} shows ML likelihood and CV MSE profiles
+as a function of $\log\phi$ at four fixed values of $\rho$. Both curves are
+computed on the no-covariate, no-RSR model to ensure direct comparability
+between objectives.
+
+```{r likelihood-surface, fig.cap="ML likelihood profiles (red) and CV MSE profile at $\\rho=0.99$ (blue, bottom-right panel only), both scaled to $[0,1]$ for comparability. Stars mark ML optima; dashed verticals mark CV-selected $\\phi$ at each $\\rho$. At low $\\rho$, ML prefers more smoothing than CV. At $\\rho=0.95$ the two methods agree closely. At $\\rho=0.99$, ML collapses to small $\\phi$ due to distortion of the likelihood surface near the intrinsic prior boundary.", fig.height=6}
+ml_grid_file <- "likelihood_surface_ml_grid.rds"
+cv_grid_file <- "likelihood_surface_cv_grid.rds"
+cv_opts_file <- "likelihood_surface_cv_opts.rds"
+
+if (file.exists(ml_grid_file) && file.exists(cv_opts_file)) {
+  ml_grid <- readRDS(ml_grid_file)
+  cv_grid <- if (file.exists(cv_grid_file)) readRDS(cv_grid_file) else NULL
+  cv_opts <- readRDS(cv_opts_file)
+
+  rho_values <- sort(unique(ml_grid$rho))
+  rho_cv     <- if (!is.null(cv_grid)) cv_grid$rho[1] else 0.99
+
+  ml_grid <- do.call(rbind, lapply(split(ml_grid, ml_grid$rho), function(d) {
+    d$ll_norm   <- d$ll - max(d$ll, na.rm = TRUE)
+    d$ll_scaled <- (d$ll_norm - min(d$ll_norm, na.rm = TRUE)) /
+                   diff(range(d$ll_norm, na.rm = TRUE))
+    d
+  }))
+
+  ml_opt <- do.call(rbind, lapply(rho_values, function(rho) {
+    sub <- ml_grid[ml_grid$rho == rho & is.finite(ml_grid$ll), ]
+    sub[which.max(sub$ll), c("rho", "phi", "log_phi", "ll")]
+  }))
+
+  panels <- lapply(rho_values, function(rho) {
+    ml_sub <- ml_grid[ml_grid$rho == rho & is.finite(ml_grid$ll_scaled), ]
+    ml_o   <- ml_opt[ml_opt$rho == rho, ]
+    cv_o   <- cv_opts[cv_opts$rho == rho, ]
+    has_cv <- (!is.null(cv_grid) && rho == rho_cv)
+
+    p <- ggplot() +
+      geom_line(data = ml_sub, aes(x = log_phi, y = ll_scaled),
+                colour = "tomato", linewidth = 0.8) +
+      geom_point(data = ml_o, aes(x = log_phi, y = 1),
+                 colour = "tomato", shape = 8, size = 2.5)
+
+    if (has_cv) {
+      cv_sub <- cv_grid[is.finite(cv_grid$cv_mse), ]
+      cv_sub$cv_scaled <- 1 - (cv_sub$cv_mse - min(cv_sub$cv_mse, na.rm=TRUE)) /
+                              diff(range(cv_sub$cv_mse, na.rm=TRUE))
+      p <- p + geom_line(data = cv_sub, aes(x = log_phi, y = cv_scaled),
+                         colour = "steelblue", linewidth = 0.8)
+    }
+
+    p +
+      geom_vline(xintercept = ml_o$log_phi,     colour = "tomato",
+                 linetype = "dashed", linewidth = 0.5) +
+      geom_vline(xintercept = log(cv_o$phi),     colour = "steelblue",
+                 linetype = "dashed", linewidth = 0.5) +
+      annotate("text", x = ml_o$log_phi,    y = 0.05,
+               label = sprintf("ML\n%.3f", ml_o$phi),
+               hjust = 1.1, size = 2.4, colour = "tomato") +
+      annotate("text", x = log(cv_o$phi), y = 0.18,
+               label = sprintf("CV\n%.3f", cv_o$phi),
+               hjust = -0.1, size = 2.4, colour = "steelblue") +
+      scale_y_continuous(limits = c(0, 1), labels = NULL) +
+      labs(x = expression(log~phi), y = NULL,
+           title = bquote(rho == .(rho)),
+           subtitle = if (has_cv) "Red = ML  |  Blue = CV (scaled)"
+                      else        "Red = ML  |  Blue dashed = CV opt") +
+      theme_minimal(base_size = 9) +
+      theme(panel.grid.minor = element_blank())
+  })
+
+  print(
+    (panels[[1]] | panels[[2]]) / (panels[[3]] | panels[[4]]) +
+      plot_annotation(caption = "SIF data, no covariates, no RSR, no $R^{-1}$.")
+  )
+} else {
+  cat("Likelihood surface cache files not found.",
+      "Run plot\\_likelihood\\_surface.R to generate them.")
+}
+```
+
+The ML optimum shifts systematically with $\rho$. At moderate $\rho$,
+ML prefers more smoothing than CV; at $\rho \approx 0.95$ the two methods
+agree closely; at $\rho = 0.99$ ML collapses to very small $\phi$. This
+collapse arises because the log-determinant term $\tfrac{1}{2}\log|Q(\rho)|$
+in the ML objective diverges as $Q$ becomes increasingly ill-conditioned
+near the intrinsic prior boundary, distorting the likelihood surface. The CV
+objective is unaffected by prior geometry and maintains a stable interior
+minimum across all $\rho$ values.
+
+```{r ml-cv-table}
+results_for_table <- list(
+  list("Random CV, RSR + $R^{-1}$ (canonical)", "SIF",
+       load_result("results_sif_canonical")),
+  list("Blocked CV, RSR + $R^{-1}$", "SIF",
+       load_result("results_sif_cv_blocked")),
+  list("ML, $\\rho$ free", "SIF",
+       load_result("results_sif_water_ml")),
+  list("ML, $\\rho=0.95$ fixed", "SIF",
+       load_result("results_sif_rho095_ml")),
+  list("CV, $\\rho=0.95$ fixed", "SIF",
+       load_result("results_sif_rho095_cv")),
+  list("Random CV, RSR (canonical)", "Albedo",
+       load_result("results_water_rsr_rho1")),
+  list("Blocked CV, RSR", "Albedo",
+       load_result("results_cv_blocked")),
+  list("ML, $\\rho$ free", "Albedo",
+       load_result("results_water_ml"))
+)
+
+tbl_df <- do.call(rbind, lapply(results_for_table, function(x) {
+  nm <- x[[1]]; ds <- x[[2]]; r <- x[[3]]
+  if (is.null(r)) return(NULL)
+  data.frame(Method  = nm,
+             Dataset = ds,
+             rho     = round(r$rho_opt %||% 1, 3),
+             phi     = round(r$phi, 4),
+             tau     = round(1/r$phi, 2),
+             stringsAsFactors = FALSE)
+}))
+
+if (!is.null(tbl_df) && nrow(tbl_df) > 0) {
+  kable(tbl_df, format = "latex", booktabs = TRUE, escape = FALSE,
+        caption = paste0("Summary of $\\phi$ and $\\tau = 1/\\phi$ selected by each tuning ",
+                         "method on SIF and albedo data. Random CV and ML agree well at ",
+                         "$\\rho = 0.95$; blocked CV and free-$\\rho$ ML diverge due to ",
+                         "the geometric and likelihood-surface issues described above."),
+        label = "ml-cv-table")
+} else {
+  cat("Tuning comparison results not available.")
+}
+```

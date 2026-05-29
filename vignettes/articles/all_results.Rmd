@@ -1,0 +1,325 @@
+---
+title: "Supplement: Robustness Checks and Model Extensions"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    keep_tex: false
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{amsmath}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 5,
+  fig.height = 3.5
+)
+
+library(goebel2026)
+library(ggplot2)
+library(knitr)
+library(sf)
+
+# ------------------------------------------------------------------
+# Shared objects used across all sections
+# ------------------------------------------------------------------
+
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
+load_result <- function(nm) {
+  env <- new.env(parent = emptyenv())
+  data(list = nm, package = "goebel2026", envir = env)
+  env[[nm]]
+}
+
+perf_row <- function(res, label = NULL) {
+  data.frame(
+    Model    = label %||% res$run_name,
+    rho      = round(res$rho_opt          %||% NA_real_, 4),
+    phi      = round(res$phi              %||% NA_real_, 4),
+    RMSE     = round(res$rmse             %||% NA_real_, 5),
+    R2       = round(res$r2               %||% NA_real_, 4),
+    Coverage = round(res$coverage_95_obs  %||% NA_real_, 4),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+\newpage
+
+# Spatially Blocked Cross-Validation {#sec-blocking}
+
+## Motivation
+
+The baseline model selects the smoothing parameter $\hat\phi$ by 10-fold
+cross-validation, assigning soundings to folds by simple random sampling.
+Because nearby soundings overlap many of the same fine-resolution pixels,
+a randomly held-out sounding is partially explained by spatially proximate
+soundings that remain in the training set. This leakage can cause CV to
+underestimate generalisation error and favour overly rough solutions.
+
+Spatially blocked CV addresses this by partitioning soundings into $K$
+geographically contiguous blocks before assigning fold labels, so that
+all soundings in a held-out fold are spatially separated from the training
+soundings. The blocks are defined by $k$-means clustering of sounding
+centroids (stored in \texttt{setup\_albedo\$blocked\_folds}).
+
+## Fold structure
+
+Figure \ref{fig:fold-map} shows the spatial arrangement of the 10 blocked
+folds. Each sounding polygon is coloured by its fold assignment; the target
+grid is shown in grey as a reference for the domain extent.
+
+```{r fold-map, fig.cap="Spatial fold assignments for the blocked cross-validation scheme. Each sounding polygon is coloured by fold; the grey background shows the target grid domain.", fig.height=4.5}
+
+soundings_sf      <- goebel2026::setup_shared$soundings_proj
+blocked_folds     <- goebel2026::setup_albedo$blocked_folds
+soundings_sf$fold <- factor(blocked_folds)
+
+ggplot() +
+  geom_sf(data = goebel2026::target_grid, fill = "grey92", colour = NA) +
+  geom_sf(data = soundings_sf, aes(fill = fold), colour = NA, alpha = 0.8) +
+  scale_fill_brewer(palette = "Paired", name = "Fold") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text  = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank())
+```
+
+## Performance comparison
+
+```{r blocking-table}
+res_queen   <- load_result("results_water_rsr_rho1")
+res_blocked <- load_result("results_cv_blocked")
+
+tab <- rbind(
+  perf_row(res_queen,   "Random CV (baseline)"),
+  perf_row(res_blocked, "Blocked CV")
+)
+rownames(tab) <- NULL
+
+knitr::kable(
+  tab, booktabs = TRUE,
+  col.names = c("Model", "$\\hat\\rho$", "$\\hat\\phi$",
+                "RMSE", "$R^2$", "Coverage (95\\%)"),
+  escape  = FALSE,
+  caption = "Random vs.\\ spatially blocked CV. Performance computed
+             over pixels with at least one overlapping sounding."
+)
+```
+
+Blocked CV selects a substantially smaller $\hat\phi$ than random CV
+(`r round(res_blocked$phi, 1)` vs.\ `r round(res_queen$phi, 1)`),
+consistent with the expected direction: withholding the overlap-rich
+central strip forces the CV objective to favour less smoothing, since
+held-out predictions must rely more heavily on spatial extrapolation.
+Despite this, downstream predictive performance (RMSE, $R^2$, coverage)
+is nearly identical between the two schemes. This robustness is
+attributable to the footprint-averaging structure of the forward
+operator: each sounding integrates over many fine-resolution pixels,
+so spatial leakage between randomly assigned folds is already limited.
+We therefore use random CV in the main analysis as the simpler and
+computationally cheaper option.
+
+\newpage
+
+# Soft Penalty on Spatial Confounding {#sec-softrsr}
+
+## Hard vs.\ soft RSR
+
+Hard restricted spatial regression (RSR) enforces the orthogonality
+constraint
+$$
+X^{(o)\top} A\, r^{(\ell)} = 0
+$$
+exactly via a Schur-complement projection of the posterior. Every posterior
+draw satisfies this constraint with probability one. While this cleanly
+removes covariate signal from the spatial residual, it is an all-or-nothing
+operation: there is no mechanism to allow partial confounding when the data
+weakly support it.
+
+The soft-penalty variant replaces the hard projection with a quadratic
+penalty added directly to the prior precision,
+$$
+\Lambda_{\tau,\alpha}
+  = \tau\,(I - W)^\top(I - W)
+  + \alpha\,\tilde{C}^\top\tilde{C},
+  \qquad
+  \tilde{C} := \frac{X^{(o)\top}A}{\|X^{(o)\top}A\|_F},
+$$
+where $\alpha \geq 0$ controls the strength of the confounding penalty and
+$\tilde{C}$ is the Frobenius-normalised constraint matrix. At $\alpha = 0$
+this recovers the unconstrained SAR prior; as $\alpha \to \infty$ the
+penalty dominates and the posterior approaches the hard-RSR solution. The
+penalty adds only a rank-$q$ correction to the precision (where $q$ is the
+number of covariates, here $q = 2$), so the sparsity structure of the
+spatial precision is preserved.
+
+Both $\phi$ and $\alpha$ are selected jointly by a grid search over
+$\rho \in \{0.70, 0.90, 0.95, 0.99\}$ and
+$\log\alpha \in \{-4, -3, \ldots, 4\}$, with $\phi$ profiled out at each
+grid point via CV.
+
+## CV surface
+
+```{r softrsr-surface, fig.cap="Cross-validation MSE surface over the soft-penalty grid. Fill colour shows CV MSE at each $(\\rho, \\log\\alpha)$ point with $\\phi$ profiled out. The white star marks the selected optimum.", fig.width=5.5, fig.height=3.2}
+
+res_soft <- load_result("results_softrsr_albedo")
+
+grid_df   <- res_soft$grid
+best_i    <- which.min(grid_df$cv_mse)
+
+ggplot(grid_df, aes(x = log_alpha, y = factor(rho), fill = cv_mse)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  geom_point(data = grid_df[best_i, ],
+             aes(x = log_alpha, y = factor(rho)),
+             shape = 8, colour = "white", size = 3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(option = "magma", direction = -1, name = "CV MSE") +
+  scale_x_continuous(breaks = seq(-4, 4, by = 2)) +
+  labs(x = expression(log~alpha), y = expression(rho)) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank())
+```
+
+Figure \ref{fig:softrsr-surface} shows the CV MSE across the grid. The
+surface is relatively flat across a wide range of $\alpha$ for each $\rho$,
+with the minimum at
+$\rho = `r res_soft$rho_opt`$,
+$\alpha = `r round(res_soft$alpha_opt, 3)`$.
+The insensitivity to $\alpha$ suggests the data do not strongly distinguish
+between partial and full confounding adjustment in this setting.
+
+## Performance comparison
+
+```{r softrsr-table}
+res_hard <- load_result("results_water_rsr_rho1")
+
+tab <- rbind(
+  perf_row(res_hard, "Hard RSR (baseline)"),
+  perf_row(res_soft, "Soft penalty RSR")
+)
+rownames(tab) <- NULL
+
+knitr::kable(
+  tab, booktabs = TRUE,
+  col.names = c("Model", "$\\hat\\rho$", "$\\hat\\phi$",
+                "RMSE", "$R^2$", "Coverage (95\\%)"),
+  escape  = FALSE,
+  caption = "Hard RSR vs.\\ soft penalty. The soft model tunes $\\alpha$
+             jointly with $\\phi$ via grid search CV."
+)
+```
+
+\newpage
+
+# Landcover-Aware Neighbor Weights {#sec-neighbors}
+
+## Motivation
+
+The standard SAR prior uses queen adjacency with uniform row-normalised
+weights: $\widetilde W_{ij} = 1/n_i$ for all queen-adjacent pixel pairs,
+regardless of land-cover type. One concern is that this couples land and
+water pixels symmetrically, pulling water-pixel estimates toward their
+land neighbors. Once water proportion is included as a covariate the
+model already has a direct mechanism to separate land and water signal,
+but the prior still shares spatial strength across boundaries.
+
+We evaluate three modifications to the neighbor structure, all using
+water covariate + RSR + $\rho = 1$ as the base model:
+
+- **Rook adjacency**: restricts neighbors to the four cardinal directions
+  (no diagonals), reducing each interior pixel from 8 to 4 neighbors.
+
+- **Epsilon-floor weights** (variant A): within-type edges receive weight
+  proportional to 1 and cross-type edges proportional to
+  $\varepsilon = e^{-\alpha}$, with $\alpha \geq 0$ tuned by CV.
+  At $\alpha = 0$ this recovers uniform queen weights; large $\alpha$
+  drives cross-boundary weights toward zero.
+
+- **Soft-alpha weights** (variant B): edge weights decay continuously with
+  the difference in water fraction,
+  $w_{ij} \propto \exp(-\alpha\,|f_i - f_j|)$,
+  where $f_i$ is the water fraction of pixel $i$ and $\alpha$ is CV-tuned.
+  This variant uses the full continuous water fraction rather than a binary
+  land/water indicator.
+
+## Weight structure
+
+```{r weight-illustration, fig.cap="Edge weight as a function of neighbor water fraction $f_j$, for a focal pixel with water fraction $f_i = 0.8$. The dotted vertical line marks the land/water threshold at 0.5. Alpha values shown are CV-selected optima from the package results.", fig.width=5, fig.height=3}
+
+res_eps   <- load_result("results_neighbor_lc_eps")
+res_alpha <- load_result("results_neighbor_lc_alpha")
+
+alpha_eps   <- res_eps$tags$alpha   %||% 2
+alpha_alpha <- res_alpha$tags$alpha %||% 2
+
+f_i <- 0.8
+f_j <- seq(0, 1, length.out = 200)
+
+is_water_i <- f_i > 0.5
+eps  <- exp(-alpha_eps)
+w_A  <- ifelse((f_j > 0.5) == is_water_i, 1, eps)
+w_A  <- w_A / mean(w_A)
+
+w_B  <- exp(-alpha_alpha * abs(f_j - f_i)) + 1e-6
+w_B  <- w_B / mean(w_B)
+
+df_ill <- data.frame(
+  f_j    = rep(f_j, 3),
+  weight = c(rep(1, length(f_j)), w_A, w_B),
+  model  = rep(c("Queen (uniform)",
+                 sprintf("Epsilon-floor (alpha=%.2f)", alpha_eps),
+                 sprintf("Soft-alpha (alpha=%.2f)",    alpha_alpha)),
+               each = length(f_j))
+)
+
+ggplot(df_ill, aes(x = f_j, y = weight, colour = model, linetype = model)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0.5, linetype = "dotted", colour = "grey50") +
+  scale_colour_manual(values = c("grey50", "#E69F00", "#0072B2")) +
+  scale_linetype_manual(values = c("dashed", "solid", "solid")) +
+  labs(x = expression("Neighbor water fraction " * f[j]),
+       y = "Relative edge weight",
+       colour = NULL, linetype = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8))
+```
+
+## Performance comparison
+
+```{r neighbor-table}
+res_queen <- load_result("results_water_rsr_rho1")
+res_rook  <- load_result("results_neighbor_rook")
+res_lc    <- load_result("results_neighbor_lc")
+
+tab <- rbind(
+  perf_row(res_queen, "Queen, uniform (baseline)"),
+  perf_row(res_rook,  "Rook, uniform"),
+  perf_row(res_lc,    "Queen, landcover binary"),
+  perf_row(res_eps,   sprintf("Queen, epsilon-floor (alpha=%.2f)", alpha_eps)),
+  perf_row(res_alpha, sprintf("Queen, soft-alpha (alpha=%.2f)",    alpha_alpha))
+)
+rownames(tab) <- NULL
+
+knitr::kable(
+  tab, booktabs = TRUE,
+  col.names = c("Model", "$\\hat\\rho$", "$\\hat\\phi$",
+                "RMSE", "$R^2$", "Coverage (95\\%)"),
+  escape  = FALSE,
+  caption = "Neighbor structure sensitivity. All models use water covariate
+             + RSR + $\\rho = 1$. Alpha values shown are CV-selected optima."
+)
+```
+
+All landcover-aware variants perform comparably to the uniform queen
+baseline. The tuned $\alpha$ values indicate a mild preference for
+down-weighting cross-boundary edges, but the effect on RMSE and $R^2$
+is negligible. This is consistent with the water covariate already
+capturing the dominant land--water contrast in the latent field, leaving
+little residual structure for the weight matrix to exploit.

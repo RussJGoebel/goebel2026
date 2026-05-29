@@ -1,0 +1,1239 @@
+---
+title: "Supplementary Materials: Bayesian Downscaling of Satellite-Derived Solar-Induced Chlorophyll Fluorescence"
+author: "Russell Goebel, Leeza Moldavchuk, Taylor S. Jones, Jonathan Dooley, Lucy R. Hutyra, Luis Carvalho"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: pdflatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "\\textwidth"
+)
+
+library(goebel2026)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(knitr)
+library(scales)
+library(sf)
+library(gstat)
+
+# Shared formatting helpers
+fmt2 <- function(x) sprintf("%.2f", x)
+fmt3 <- function(x) sprintf("%.3f", x)
+fmt4 <- function(x) sprintf("%.4f", x)
+fmt1 <- function(x) sprintf("%.1f", x)
+pct  <- function(x) sprintf("%.1f%%", 100 * x)
+
+# Load all result objects fresh from package (avoids stale session cache)
+.pkg_get <- function(nm) get(nm, envir = asNamespace("goebel2026"))
+
+r <- list(
+  # Albedo ablation
+  ols             = .pkg_get("results_ols_baseline"),
+  no_cov          = .pkg_get("results_no_cov_rho1"),
+  water           = .pkg_get("results_water_rho1"),
+  water_rsr       = .pkg_get("results_water_rsr_rho1"),
+  water_rsr_cv    = .pkg_get("results_water_rsr_rho_cv"),
+  water_rho_cv    = .pkg_get("results_water_rho_cv"),
+  # SIF
+  sif             = .pkg_get("results_sif_canonical"),
+  sif_naive       = .pkg_get("results_sif_naive"),
+  sif_rsr_rho1    = .pkg_get("results_sif_rsr_rho1"),
+  # Tuning
+  cv_blocked      = .pkg_get("results_cv_blocked"),
+  water_ml        = .pkg_get("results_water_ml"),
+  sif_cv_blocked  = .pkg_get("results_sif_cv_blocked"),
+  sif_water_ml    = .pkg_get("results_sif_water_ml"),
+  sif_rho095_ml   = .pkg_get("results_sif_rho095_ml"),
+  sif_rho095_cv   = .pkg_get("results_sif_rho095_cv"),
+  # Neighbours
+  nb_rook         = .pkg_get("results_neighbor_rook"),
+  nb_lc_eps       = .pkg_get("results_neighbor_lc_eps"),
+  nb_lc_alpha     = .pkg_get("results_neighbor_lc_alpha"),
+  sif_nb_rook     = .pkg_get("results_sif_neighbor_rook"),
+  sif_nb_lc_eps   = .pkg_get("results_sif_neighbor_lc_eps"),
+  sif_nb_lc_alpha = .pkg_get("results_sif_neighbor_lc_alpha"),
+  # Forward operator
+  alb_gA_tau05    = .pkg_get("results_albedo_gA_tau05"),
+  alb_gA_tau033   = .pkg_get("results_albedo_gA_tau033"),
+  alb_gA_tau02    = .pkg_get("results_albedo_gA_tau02"),
+  alb_gA_tau01    = .pkg_get("results_albedo_gA_tau01"),
+  alb_gA_cent     = .pkg_get("results_albedo_gA_centroid"),
+  sif_gA_tau05    = .pkg_get("results_sif_gA_tau05"),
+  sif_gA_tau033   = .pkg_get("results_sif_gA_tau033"),
+  sif_gA_tau02    = .pkg_get("results_sif_gA_tau02"),
+  sif_gA_tau01    = .pkg_get("results_sif_gA_tau01"),
+  sif_gA_tau001   = .pkg_get("results_sif_gA_tau001"),
+  # Kriging
+  krig_alb        = .pkg_get("results_kriging_albedo"),
+  krig_sif        = .pkg_get("results_kriging_sif"),
+  # Soft RSR
+  softrsr         = .pkg_get("results_softrsr_albedo"),
+  # Contingency
+  ct_uu           = .pkg_get("results_contingency_uu"),
+  ct_ug           = .pkg_get("results_contingency_ug"),
+  ct_gu           = .pkg_get("results_contingency_gu"),
+  ct_gg           = .pkg_get("results_contingency_gg")
+)
+
+# Likelihood surfaces
+ls_alb <- .pkg_get("likelihood_surface_albedo")
+ls_sif <- .pkg_get("likelihood_surface_sif")
+
+# Safe rho extraction -- fixed-rho results don't store rho_opt
+get_rho <- function(x, default = 1.0) {
+  v <- x$rho_opt
+  if (is.null(v) || length(v) == 0) default else v
+}
+
+# Safe field extraction -- returns NA if field is NULL/missing
+gf <- function(x, field, idx = NULL) {
+  v <- x[[field]]
+  if (is.null(v) || length(v) == 0) return(NA_real_)
+  if (!is.null(idx)) v <- v[idx]
+  if (length(v) == 0) NA_real_ else v
+}
+
+# Helper: extract tau = 1/phi from a result object
+get_tau <- function(x) {
+  phi <- gf(x, "phi")
+  if (is.na(phi)) NA_real_ else 1 / phi
+}
+
+# Safe field extraction (multi-name fallback)
+get_field <- function(x, ...) {
+  fields <- c(...)
+  for (f in fields) {
+    v <- x[[f]]
+    if (!is.null(v) && length(v) > 0) return(v)
+  }
+  NA_real_
+}
+```
+
+\newpage
+
+# Proofs {#sec:proofs}
+
+## Proof of Lemma 1: Expected squared error for approximate averaging {#sec:proof-lemma1}
+
+This lemma justifies the aggregation operator $A$ used in Equation~(7) of
+the main text by showing that the per-intersection approximation error
+vanishes as the latent grid is refined.
+
+**Lemma 1.** *Let $v : D \to \mathbb{R}$ be a mean-zero second-order
+stochastic process with variogram $\gamma(s,t) := \frac{1}{2}E[(v(s)-v(t))^2]$.
+Let $A \subset B \subset D$ be measurable subsets and $g : A \to \mathbb{R}$
+square-integrable. Define*
+$$\bar{g}_A := \frac{1}{|A|}\int_A g(s)\,ds, \qquad \delta_g := \max_{x,y\in A}|g(x)-g(y)|.$$
+*Then the squared error of the approximation*
+$$\int_A g(s)v(s)\,ds \;\approx\; \bar{g}_A \cdot \frac{|A|}{|B|}\int_B v(s)\,ds$$
+*satisfies*
+\begin{equation}\label{eq:lemma1}
+E\!\left[\left(\int_A g(s)v(s)\,ds - \bar{g}_A \cdot \frac{|A|}{|B|}\int_B v(s)\,ds\right)^{\!2}\right]
+\;\leq\;
+\delta_g^2 \iint_{A\times A}\!\gamma\,ds\,dt
+\;+\; 2\bar{g}_A^2(1-\alpha)\alpha\iint_{A\times(B\setminus A)}\!\gamma\,ds\,dt
+\;+\; 2|\bar{g}_A|\delta_g\iint_{A\times B}\!\gamma\,ds\,dt,
+\end{equation}
+*where $\alpha = |A|/|B|$.*
+
+In the application, $A = D_i^{(o)} \cap D_j^{(\ell)}$ is the intersection
+of sounding footprint $i$ with latent cell $j$, and $B = D_j^{(\ell)}$ is
+the full latent cell. The approximation replaces the integral of $g_i v$
+over the clipped intersection with the rescaled cell average of $v$, which
+is exactly the construction of the aggregation matrix in Equation~(5) of
+the main text.
+
+**Proof.**
+
+**Step 1: Decompose the error.**
+
+Define $f(s) := g(s) - \bar{g}_A$ and $h(s) := \mathbf{1}_A(s) - |A|/|B|$.
+These satisfy $\int_A f(s)\,ds = 0$ and $\int_B h(s)\,ds = 0$ by
+construction. Writing the error as $E := \int_A g(s)v(s)\,ds -
+\bar{g}_A \cdot \frac{|A|}{|B|}\int_B v(s)\,ds$, we decompose:
+$$E = \int_A (g(s) - \bar{g}_A)v(s)\,ds
+    + \bar{g}_A\!\left(\int_A v(s)\,ds - \frac{|A|}{|B|}\int_B v(s)\,ds\right)
+  =: T_1 + T_2,$$
+where $T_1 = \int_A f(s)v(s)\,ds$ and $T_2 = \bar{g}_A\int_B h(s)v(s)\,ds$.
+Then $E[E^2] = E[T_1^2] + E[T_2^2] + 2E[T_1 T_2]$.
+
+**Step 2: A useful identity.**
+
+Since $v$ is mean-zero, $E[v(s)v(t)] = \mathrm{Cov}(v(s),v(t))$. From
+the variogram definition:
+$$E[v(s)v(t)] = \tfrac{1}{2}\!\left(E[v(s)^2] + E[v(t)^2]\right) - \gamma(s,t).$$
+A key consequence is that integrating $E[v(s)v(t)]$ against any weight of
+the form $u(s)q(t)$ with $\int u(s)\,ds = 0$ eliminates the marginal
+variance terms, leaving only the $-\gamma$ contribution. We apply this
+repeatedly below.
+
+**Step 3: Bound $E[T_1^2]$.**
+
+$$E[T_1^2] = \iint_{A\times A} f(s)f(t)\,E[v(s)v(t)]\,ds\,dt
+= \iint_{A\times A} f(s)f(t)\left[\tfrac{1}{2}(E[v(s)^2]+E[v(t)^2]) - \gamma(s,t)\right]ds\,dt.$$
+The marginal variance terms vanish since $\int_A f(s)\,ds = 0$, leaving:
+$$E[T_1^2] = -\iint_{A\times A} f(s)f(t)\,\gamma(s,t)\,ds\,dt.$$
+Bounding $|f(s)f(t)| \leq \delta_g^2$:
+$$E[T_1^2] \leq \delta_g^2\iint_{A\times A}\gamma(s,t)\,ds\,dt.$$
+
+**Step 4: Bound $E[T_2^2]$.**
+
+$$E[T_2^2] = \bar{g}_A^2\iint_{B\times B} h(s)h(t)\,E[v(s)v(t)]\,ds\,dt.$$
+The marginal variance terms vanish since $\int_B h(s)\,ds = 0$, leaving:
+$$E[T_2^2] = -\bar{g}_A^2\iint_{B\times B} h(s)h(t)\,\gamma(s,t)\,ds\,dt.$$
+Writing $\alpha = |A|/|B|$ and decomposing $B\times B$ into four regions
+according to whether each point lies in $A$ or $B\setminus A$, and
+substituting the values of $h$:
+$$h(s)h(t) = \begin{cases}
+(1-\alpha)^2  & s,t \in A,\\
+\alpha^2      & s,t \in B\setminus A,\\
+-(1-\alpha)\alpha & \text{one in } A \text{, one in } B\setminus A,
+\end{cases}$$
+gives:
+\begin{align*}
+E[T_2^2] &= \underbrace{-\bar{g}_A^2(1-\alpha)^2\iint_{A\times A}\gamma\,ds\,dt}_{\leq\,0}
+           \;\underbrace{-\,\bar{g}_A^2\alpha^2\iint_{(B\setminus A)^2}\gamma\,ds\,dt}_{\leq\,0}
+           \;\underbrace{+\,2\bar{g}_A^2(1-\alpha)\alpha\iint_{A\times(B\setminus A)}\gamma\,ds\,dt}_{\geq\,0},
+\end{align*}
+where the two cross-region integrals have been combined using symmetry of
+$\gamma$. Since $\gamma \geq 0$, the first two terms are non-positive and
+may be dropped to obtain an upper bound:
+$$E[T_2^2] \leq 2\bar{g}_A^2(1-\alpha)\alpha\iint_{A\times(B\setminus A)}\gamma(s,t)\,ds\,dt.$$
+
+**Step 5: Bound $|E[T_1 T_2]|$.**
+
+$$E[T_1 T_2] = \bar{g}_A\iint_{A\times B} f(s)h(t)\,E[v(s)v(t)]\,ds\,dt.$$
+The marginal variance terms vanish (using $\int_A f\,ds = 0$ and $\int_B
+h\,dt = 0$ separately), leaving:
+$$E[T_1 T_2] = -\bar{g}_A\iint_{A\times B} f(s)h(t)\,\gamma(s,t)\,ds\,dt.$$
+Bounding $|f(s)| \leq \delta_g$ and $|h(t)| \leq 1$ throughout $B$:
+$$|E[T_1 T_2]| \leq |\bar{g}_A|\,\delta_g\iint_{A\times B}\gamma(s,t)\,ds\,dt.$$
+
+**Step 6: Combine.**
+
+$$E[E^2] = E[T_1^2] + E[T_2^2] + 2E[T_1 T_2]
+\leq E[T_1^2] + E[T_2^2] + 2|E[T_1 T_2]|$$
+$$\leq \delta_g^2\iint_{A\times A}\gamma\,ds\,dt
++ 2\bar{g}_A^2(1-\alpha)\alpha\iint_{A\times(B\setminus A)}\gamma\,ds\,dt
++ 2|\bar{g}_A|\delta_g\iint_{A\times B}\gamma\,ds\,dt. \qquad\square$$
+
+**Corollary 1** *(Consistency as resolution increases).* *Suppose
+$\gamma(s,t) \leq \Gamma$ and $|g(s)| \leq G$ uniformly. Under a regular
+tiling in which each latent cell has diameter $h$, the total mean squared
+approximation error for a single observation summed over all intersecting
+cells is bounded by $O(h^d)$, which vanishes as $h \to 0$.*
+
+*Proof.* With $B = D_j^{(\ell)}$ and $A = D_i^{(o)} \cap D_j^{(\ell)}$,
+both $|A|$ and $|B|$ are $O(h^d)$, and $\alpha = |A|/|B|$ remains bounded
+in $(0,1)$ as the grid is refined. Each integration region in
+\eqref{eq:lemma1} therefore has measure $O(h^d)\cdot O(h^d) = O(h^{2d})$,
+giving each term a magnitude of $O(h^{2d})$. There are $O(h^{-d})$ latent
+cells intersecting a single sounding footprint, so the total error summed
+over cells is $O(h^{-d}) \cdot O(h^{2d}) = O(h^d) \to 0$. $\square$
+
+\newpage
+
+## Proof of Lemma 2: Invertibility of $A^\top A + \Lambda_\tau$ {#sec:proof-lemma2}
+
+This result guarantees that the posterior precision matrix is invertible
+even when the intrinsic SAR prior ($\rho = 1$) is used, so that the
+posterior mean and covariance are well defined.
+
+**Lemma 2.** *Let $W$ be an $m \times m$ irreducible row-stochastic matrix,
+and let $A$ be an $n \times m$ matrix whose rows each sum to~$1$. Define
+$\Lambda_\tau = \tau(I - W)^\top(I - W)$ with $\tau > 0$. Then
+$A^\top A + \Lambda_\tau$ is positive definite, hence invertible.*
+
+**Proof.**
+
+Since $A^\top A$ and $\Lambda_\tau$ are both positive semidefinite, we have
+$v^\top(A^\top A + \Lambda_\tau)v \geq 0$ for all $v \in \mathbb{R}^m$.
+It suffices to show that equality cannot hold for any nonzero $v$.
+
+Suppose $v^\top \Lambda_\tau v = 0$. Then:
+$$v^\top \Lambda_\tau v = \tau\,\|(I-W)v\|^2 = 0,$$
+which implies $(I-W)v = 0$, so $v$ lies in the null space of $I - W$.
+Since $W$ is irreducible and row-stochastic, its only eigenvalue of $1$
+has a one-dimensional eigenspace spanned by $\mathbf{1}$, so
+$v = c\mathbf{1}$ for some scalar $c$.
+
+Evaluating $v^\top A^\top A v$ at $v = c\mathbf{1}$:
+$$v^\top A^\top A v = c^2\,\|A\mathbf{1}_m\|^2.$$
+Since each row of $A$ sums to $1$, we have $A\mathbf{1}_m = \mathbf{1}_n$,
+and therefore:
+$$c^2\,\|A\mathbf{1}_m\|^2 = c^2\,\|\mathbf{1}_n\|^2 = c^2 n.$$
+This equals zero only if $c = 0$, i.e.\ $v = 0$. Therefore no nonzero $v$
+satisfies $v^\top(A^\top A + \Lambda_\tau)v = 0$, so $A^\top A + \Lambda_\tau$
+is positive definite and hence invertible. $\square$
+
+*Remark.* For $\rho < 1$, $W = \rho\tilde{W}$ is no longer row-stochastic
+and $\ker(I - W) = \{0\}$, so $\Lambda_\tau$ is already positive definite
+on its own and invertibility of $A^\top A + \Lambda_\tau$ is immediate. The
+lemma is therefore most useful for the intrinsic case $\rho = 1$ used in
+the main analysis.
+
+\newpage
+
+# Hyperparameter Tuning {#sec:tuning}
+
+The smoothing parameter $\tau$ controls the signal-to-noise ratio of the
+spatial random effect and must be selected from data. We compare three
+approaches: (1) random $K$-fold cross-validation (random CV), which assigns
+soundings to folds uniformly at random; (2) spatially blocked cross-validation
+(blocked CV), which assigns soundings to contiguous spatial blocks; and (3)
+marginal likelihood maximisation (ML). Throughout this section we fix
+$\rho = 0.95$ and include no covariates or RSR constraint, so that differences
+in selected $\tau$ reflect the tuning method alone.
+
+**Spatial blocking criterion.** For blocked CV, soundings are assigned to
+folds by $k$-means clustering on their centroid coordinates, with $k = 10$.
+This produces spatially contiguous blocks whose sizes reflect the local
+sounding density — denser regions (the centre of the target-mode acquisition)
+yield larger blocks. Figure 1 shows the resulting fold
+assignments overlaid on the sounding geometries, coloured by fold index.
+The concentration of soundings in the central strip means that a single
+held-out block may remove a disproportionately large and informationally dense
+region from the training set, which we conjecture contributes to the
+divergent $\tau$ selection documented below.
+
+```{r fold_map, fig.cap="Spatial fold assignments for blocked (left) and random (right) 10-fold cross-validation. Each sounding is coloured by its fold index. Blocked folds form contiguous spatial regions; random folds are scattered uniformly. The central high-density strip falls predominantly within one or two blocked folds, meaning that holding out a single block may remove a disproportionately informative set of soundings from the training set.", fig.height=4, fig.width=9}
+
+soundings_sf  <- goebel2026::setup_shared$soundings_proj
+folds_blocked <- goebel2026::setup_albedo$blocked_folds
+set.seed(2026L)
+folds_random  <- sample(rep_len(1:10, nrow(soundings_sf)))
+
+soundings_sf$fold_blocked <- factor(folds_blocked)
+soundings_sf$fold_random  <- factor(folds_random)
+
+bb <- sf::st_bbox(soundings_sf)
+
+make_fold_plot <- function(sf_obj, fold_col, title) {
+  ggplot(sf_obj) +
+    geom_sf(aes(fill = .data[[fold_col]]), color = NA, alpha = 0.8) +
+    scale_fill_manual(
+      values = setNames(scales::hue_pal()(10), as.character(1:10)),
+      name = "Fold", guide = guide_legend(ncol = 2)
+    ) +
+    coord_sf(xlim = c(bb["xmin"], bb["xmax"]),
+             ylim = c(bb["ymin"], bb["ymax"]),
+             expand = FALSE) +
+    labs(title = title) +
+    theme_void(base_size = 9) +
+    theme(legend.position  = "right",
+          plot.title       = element_text(size = 10, hjust = 0.5))
+}
+
+p_blk <- make_fold_plot(soundings_sf, "fold_blocked", "Blocked CV")
+p_rnd <- make_fold_plot(soundings_sf, "fold_random",  "Random CV")
+p_blk | p_rnd
+```
+
+## Likelihood and CV objective profiles
+
+Figure 2 shows the ML log-likelihood and CV MSE
+profiles as functions of $\log\tau$ for both albedo (left) and SIF (right).
+All three objectives are scaled to $[0, 1]$ and oriented so that higher is
+better.
+
+For both responses, the ML and random CV profiles peak at similar values of
+$\tau$: the ratio of random CV to ML optima is
+`r fmt2((1/ls_alb$ml_phi_opt) / (1/ls_alb$cv_phi_random))`x for albedo and
+`r fmt2((1/ls_sif$ml_phi_opt) / (1/ls_sif$cv_phi_random))`x for SIF, indicating
+strong agreement between the two methods. Both profiles have broad, flat
+peaks, suggesting that predictions are relatively insensitive to the exact
+value of $\tau$ in this region.
+
+Spatially blocked CV selects a substantially different $\tau$: its optimum is
+`r fmt2((1/ls_alb$cv_phi_blocked) / (1/ls_alb$cv_phi_random))`x smaller than the
+random CV optimum for albedo and
+`r fmt2((1/ls_sif$cv_phi_blocked) / (1/ls_sif$cv_phi_random))`x smaller for SIF.
+One plausible explanation for this discrepancy is that removing a contiguous
+spatial block disproportionately removes the most densely observed region of
+the domain, creating a train/test density mismatch that may not reflect
+generalisation error at the actual observation density. Under this
+interpretation, the held-out block is farther from its training neighbours
+than a typical held-out sounding would be, possibly inducing less smoothing
+than the data warrant. Random CV, by contrast, holds out scattered soundings
+whose spatial context in the training set more closely mirrors the full
+dataset, which may explain why its selected $\tau$ agrees more closely with
+the marginal likelihood optimum.
+
+```{r likelihood_surface, fig.cap="ML log-likelihood (red) and CV MSE profiles (random CV: blue; blocked CV: green) as functions of $\\log\\tau$, for albedo (left) and SIF (right). The ML curve is scaled to $[0,1]$ globally; CV curves are normalized within a $\\pm 6$ log-unit window around each optimum so that peak shape is visible. All curves are oriented so that higher is better. Dashed vertical lines indicate the optimum for each method. Random CV and ML optima are in close agreement; blocked CV selects a substantially smaller $\\tau$ in both cases.", fig.height=4, fig.width=9}
+
+make_surface_panel <- function(surf, title, ylim = c(-0.05, 0.05)) {
+  # Convert phi grid to tau = 1/phi; log(tau) = -log(phi)
+  log_tau <- -surf$log_phi_seq
+
+  ml  <- surf$ml_ll
+  ml  <- (ml  - max(ml,  na.rm = TRUE)) /
+          abs(diff(range(ml,  na.rm = TRUE)))
+
+  # Normalize CV curves relative to variation within ±6 log-tau units of the
+  # optimum so the peak shape is visible rather than compressed by extreme tails.
+  local_norm <- function(x, lt) {
+    opt_lt  <- lt[which.min(x)]
+    window  <- abs(lt - opt_lt) <= 6
+    x_min   <- min(x, na.rm = TRUE)
+    x_range <- abs(diff(range(x[window], na.rm = TRUE)))
+    if (x_range == 0) x_range <- 1
+    -(x - x_min) / x_range
+  }
+
+  cvr <- local_norm(surf$cv_mse_random,  log_tau)
+  cvb <- local_norm(surf$cv_mse_blocked, log_tau)
+
+  df <- data.frame(
+    log_tau = rep(log_tau, 3),
+    value   = c(ml, cvr, cvb),
+    method  = rep(c("ML", "CV random", "CV blocked"), each = length(log_tau))
+  )
+  df$method <- factor(df$method, levels = c("ML", "CV random", "CV blocked"))
+
+  # Optima: log(tau_opt) = -log(phi_opt)
+  opts <- data.frame(
+    method  = factor(c("ML", "CV random", "CV blocked"),
+                     levels = c("ML", "CV random", "CV blocked")),
+    log_tau = -log(c(surf$ml_phi_opt, surf$cv_phi_random, surf$cv_phi_blocked))
+  )
+
+  subtitle_text <- sprintf(
+    "tau_opt -- ML: %.3g  |  Rand: %.3g  |  Block: %.3g",
+    1/surf$ml_phi_opt, 1/surf$cv_phi_random, 1/surf$cv_phi_blocked
+  )
+
+  ggplot(df[is.finite(df$value), ],
+         aes(x = log_tau, y = value, color = method)) +
+    geom_line(linewidth = 0.9) +
+    geom_vline(data = opts,
+               aes(xintercept = log_tau, color = method),
+               linetype = "dashed", linewidth = 0.6) +
+    scale_color_manual(
+      values = c("ML"         = "tomato",
+                 "CV random"  = "steelblue",
+                 "CV blocked" = "darkgreen"),
+      name = NULL) +
+    scale_y_continuous(limits = c(NA, 0.05)) +
+    scale_x_reverse() +
+    coord_cartesian(ylim = ylim, xlim = c(6, -13)) +
+    labs(x        = expression(log~tau),
+         y        = "Scaled objective (higher = better)",
+         title    = title,
+         subtitle = subtitle_text) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position   = "bottom",
+          panel.grid.minor  = element_blank(),
+          plot.subtitle     = element_text(size = 8, color = "grey40"))
+}
+
+p_alb <- make_surface_panel(ls_alb, "Albedo", ylim = c(-1.05, 0.05))
+p_sif <- make_surface_panel(ls_sif, "SIF",    ylim = c(-1.05, 0.05))
+p_alb | p_sif
+```
+
+## Comparison with covariate model
+
+The results above use no covariates or RSR constraint. When the water
+proportion covariate and RSR are included (as in the main analysis),
+the tuning methods still disagree. Table 1 shows CV
+results with RSR: blocked CV selects $\tau$ approximately
+`r fmt2(get_tau(r$cv_blocked) / get_tau(r$water_rsr))`x larger than
+random CV for albedo and
+`r fmt2(get_tau(r$sif_cv_blocked) / get_tau(r$sif_rsr_rho1))`x larger
+for SIF, with coverage collapsing from
+`r pct(gf(r$water_rsr,"coverage_95_obs"))` to
+`r pct(gf(r$cv_blocked,"coverage_95_obs"))` for albedo.
+
+Table 2 shows all three methods without RSR or
+covariates, at fixed $\rho=0.95$ — the same conditions as
+Figure 1. Random CV and ML agree closely (ratio
+`r fmt2((1/ls_alb$cv_phi_random) / (1/ls_alb$ml_phi_opt))`x for albedo,
+`r fmt2((1/ls_sif$cv_phi_random) / (1/ls_sif$ml_phi_opt))`x for SIF), while
+blocked CV selects a substantially smaller $\tau$ in both cases. ML cannot
+be combined with RSR since RSR is a posterior constraint with no natural
+analogue in the marginal likelihood objective; the
+`r fmt2(get_tau(r$sif_rho095_cv) / get_tau(r$sif_rho095_ml))`x ratio
+between random CV and ML at fixed $\rho=0.95$ with RSR+covariates
+(not shown) is consistent with the no-RSR comparison.
+
+Crucially, $\hat\beta_\text{water}$ is stable across both tables and both
+responses (range:
+`r fmt4(min(sapply(list(r$water_rsr, r$cv_blocked, r$water_ml), gf, "beta_hat", idx=2), na.rm=TRUE))`
+to
+`r fmt4(max(sapply(list(r$water_rsr, r$cv_blocked, r$water_ml), gf, "beta_hat", idx=2), na.rm=TRUE))`
+for albedo;
+`r fmt4(min(sapply(list(r$sif_rsr_rho1, r$sif_cv_blocked, r$sif_rho095_ml), gf, "beta_hat", idx=2), na.rm=TRUE))`
+to
+`r fmt4(max(sapply(list(r$sif_rsr_rho1, r$sif_cv_blocked, r$sif_rho095_ml), gf, "beta_hat", idx=2), na.rm=TRUE))`
+for SIF), confirming that the tuning method does not affect the
+substantive inference. Because random CV directly optimises prediction
+accuracy, produces near-nominal coverage in the semi-synthetic
+validation, and is consistent with ML at comparable model specifications,
+we prefer it for the main analysis.
+
+```{r tuning_cv}
+tuning_cv_alb <- list(r$water_rsr, r$cv_blocked)
+tuning_cv_sif <- list(r$sif_rsr_rho1, r$sif_cv_blocked)
+
+tab_cv <- data.frame(
+  Response = c("Albedo", "Albedo", "SIF", "SIF"),
+  Method   = rep(c("Random CV", "Blocked CV"), 2),
+  rho      = c(sapply(tuning_cv_alb, get_rho),
+               sapply(tuning_cv_sif, get_rho)),
+  tau      = c(sapply(tuning_cv_alb, get_tau),
+               sapply(tuning_cv_sif, get_tau)),
+  RMSE     = c(sapply(tuning_cv_alb, gf, "rmse"),
+               NA_real_, NA_real_),
+  Coverage = c(sapply(tuning_cv_alb, gf, "coverage_95_obs"),
+               NA_real_, NA_real_),
+  mean_SE  = c(NA_real_, NA_real_,
+               sapply(tuning_cv_sif, function(x)
+                 mean(x$posterior_se, na.rm = TRUE)))
+)
+
+kable(tab_cv,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "CV tuning methods with RSR constraint. Albedo results include RMSE and coverage (ground truth known); SIF reports mean posterior SE.",
+  col.names = c("Response", "Method", "rho", "tau",
+                "RMSE", "Coverage (95%)", "Mean SE"))
+```
+
+```{r tuning_nrsr}
+tab_nrsr <- data.frame(
+  Response = c("Albedo", "Albedo", "Albedo", "SIF", "SIF", "SIF"),
+  Method   = rep(c("Random CV", "Blocked CV", "ML"), 2),
+  rho      = 0.95,
+  tau      = c(1/ls_alb$cv_phi_random,
+               1/ls_alb$cv_phi_blocked,
+               1/ls_alb$ml_phi_opt,
+               1/ls_sif$cv_phi_random,
+               1/ls_sif$cv_phi_blocked,
+               1/ls_sif$ml_phi_opt)
+)
+
+kable(tab_nrsr,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "All three tuning methods without RSR constraint or covariates, at fixed rho=0.95. These are the tau optima shown in Figure 2. Random CV and ML agree closely for both responses; blocked CV selects a substantially smaller tau due to the dense OCO-2 overlap structure.",
+  col.names = c("Response", "Method", "rho", "tau (opt)"))
+```
+
+\newpage
+
+# Neighbour Weight Sensitivity {#sec:neighbours}
+
+The SAR prior is defined through a neighbourhood matrix $W$. We consider
+four specifications, all using queen adjacency as the base structure.
+Let $\mathcal{N}(i)$ denote the queen-adjacency neighbours of cell $i$,
+$n_i = |\mathcal{N}(i)|$, $w_i \in [0,1]$ the water proportion of cell $i$,
+and $\ell_{ij} = \mathbf{1}\{w_i > 0.5 \neq w_j > 0.5\}$ a binary indicator
+that the edge crosses a land--water boundary. All specifications are
+row-normalised so that $\sum_{j \in \mathcal{N}(i)} \tilde W_{ij} = 1$.
+The four specifications are:
+
+1. **Queen**: $\tilde W_{ij} = 1/n_i$ for all $j \in \mathcal{N}(i)$
+2. **Rook**: restricts to horizontal/vertical neighbours only, $\tilde W_{ij} = 1/n_i^{(\text{rook})}$
+3. **LC-eps**: $\tilde W_{ij} \propto (1 - \ell_{ij}) + \varepsilon\,\ell_{ij}$,\quad $\varepsilon = e^{-\alpha}$,\quad $\alpha$ CV-tuned
+4. **LC-alpha**: $\tilde W_{ij} \propto e^{-\alpha |w_i - w_j|} + \delta$,\quad $\delta = 10^{-6}$,\quad $\alpha$ CV-tuned
+
+In both LC-aware specifications $\alpha = 0$ recovers the queen baseline.
+Cross-validation selected moderate values of $\alpha$:
+$\hat\alpha_\text{eps} = `r fmt3(gf(r$nb_lc_eps,"alpha_opt"))`$ and
+$\hat\alpha_\text{alpha} = `r fmt3(gf(r$nb_lc_alpha,"alpha_opt"))`$.
+Figure 3 shows that at these tuned values the edge weights are only
+moderately attenuated across the land--water boundary — the LC-aware
+specifications do reduce cross-boundary communication, but not drastically.
+Even so, Tables 3 and 4 show that all four specifications give nearly
+identical predictive performance for albedo and SIF respectively. The
+takeaway is that CV selected a moderate landcover penalty, and even that
+moderate penalty made no meaningful difference to the results.
+
+```{r nb_visualization, fig.cap="Left: unnormalised edge weight as a function of water fraction difference $|w_i - w_j|$ for the two LC-aware specifications at their CV-tuned $\\alpha$ values, alongside the flat queen baseline. Both LC-aware curves are nearly flat at the tuned $\\alpha$, explaining why results are insensitive to neighbourhood specification. Right: dominant landcover in the target grid, showing the land--water boundary where LC-aware weights would differ from queen.", fig.height=3.5, fig.width=9}
+
+alpha_eps   <- gf(r$nb_lc_eps,   "alpha_opt")
+alpha_alpha <- gf(r$nb_lc_alpha, "alpha_opt")
+
+d_seq <- seq(0, 1, by = 0.01)
+
+eps_val <- exp(-alpha_eps)
+w_eps   <- ifelse(d_seq < 0.5, 1 + eps_val, eps_val)
+
+w_alpha_val <- exp(-alpha_alpha * d_seq) + 1e-6
+w_queen     <- rep(1, length(d_seq))
+
+df_w <- data.frame(
+  d      = rep(d_seq, 3),
+  weight = c(w_queen, w_eps, w_alpha_val),
+  Spec   = rep(c(
+    "Queen (baseline)",
+    sprintf("LC-eps (alpha=%.2f)", alpha_eps),
+    sprintf("LC-alpha (alpha=%.2f)", alpha_alpha)
+  ), each = length(d_seq))
+)
+df_w$Spec <- factor(df_w$Spec, levels = unique(df_w$Spec))
+
+p_weights <- ggplot(df_w, aes(x = d, y = weight, color = Spec,
+                               linetype = Spec)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = 0.5, linetype = "dotted", color = "grey50") +
+  annotate("text", x = 0.52, y = max(df_w$weight) * 0.95,
+           label = "Land/water\nthreshold", hjust = 0, size = 2.5,
+           color = "grey50") +
+  scale_color_manual(values = c("steelblue", "orange", "tomato"), name = NULL) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotdash"), name = NULL) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x     = expression("|"*w[i] - w[j]*"|"~"(water fraction difference)"),
+       y     = "Unnormalised edge weight",
+       title = "Edge weight vs water fraction difference") +
+  theme_minimal(base_size = 9) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        plot.title       = element_text(size = 10, hjust = 0.5))
+
+tg <- goebel2026::target_grid
+dc <- tg$dominant_class
+tg$dom_class <- dplyr::case_when(
+  dc %in% c(1, 8)       ~ "Built/Bare",
+  dc %in% c(6, 7)       ~ "Water",
+  dc %in% c(2, 3, 4, 5) ~ "Green",
+  TRUE                  ~ NA_character_
+)
+
+p_lc <- ggplot(tg[!is.na(tg$dom_class), ]) +
+  geom_sf(aes(fill = dom_class), color = NA) +
+  scale_fill_manual(
+    values   = c("Built/Bare" = "#c4281b",
+                 "Water"      = "#429ae4",
+                 "Green"      = "#397e48"),
+    name     = "Landcover",
+    na.value = "grey90") +
+  labs(title = "Dominant landcover (target grid)") +
+  theme_void(base_size = 9) +
+  theme(legend.position = "right",
+        plot.title      = element_text(size = 10, hjust = 0.5))
+
+p_weights | p_lc
+```
+
+```{r nb_albedo}
+nbs_alb <- list(r$water_rsr, r$nb_rook, r$nb_lc_eps, r$nb_lc_alpha)
+
+alpha_eps_hat   <- fmt3(gf(r$nb_lc_eps,   "alpha_opt"))
+alpha_alpha_hat <- fmt3(gf(r$nb_lc_alpha, "alpha_opt"))
+
+tab_nb_alb <- data.frame(
+  Neighbourhood = c(
+    "Queen (baseline)",
+    "Rook",
+    paste0("LC-eps (alpha=", alpha_eps_hat, ")"),
+    paste0("LC-alpha (alpha=", alpha_alpha_hat, ")")
+  ),
+  rho      = sapply(nbs_alb, get_rho),
+  tau      = sapply(nbs_alb, get_tau),
+  RMSE     = sapply(nbs_alb, gf, "rmse"),
+  R2       = sapply(nbs_alb, gf, "r2"),
+  Coverage = sapply(nbs_alb, gf, "coverage_95_obs"),
+  beta_w   = sapply(nbs_alb, gf, "beta_hat", idx = 2)
+)
+
+kable(tab_nb_alb,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "Albedo predictive performance across neighbourhood weight specifications. All models include the water proportion covariate and RSR constraint at rho=1.",
+  col.names = c("Neighbourhood", "rho", "tau",
+                "RMSE", "R2", "Coverage (95%)",
+                "beta_water"))
+```
+
+```{r nb_sif}
+nbs_sif <- list(r$sif_rsr_rho1, r$sif_nb_rook, r$sif_nb_lc_eps, r$sif_nb_lc_alpha)
+
+alpha_sif_eps_hat   <- fmt3(gf(r$sif_nb_lc_eps,   "alpha_opt"))
+alpha_sif_alpha_hat <- fmt3(gf(r$sif_nb_lc_alpha, "alpha_opt"))
+
+tab_nb_sif <- data.frame(
+  Neighbourhood = c(
+    "Queen (baseline)",
+    "Rook",
+    paste0("LC-eps (alpha=", alpha_sif_eps_hat, ")"),
+    paste0("LC-alpha (alpha=", alpha_sif_alpha_hat, ")")
+  ),
+  rho     = sapply(nbs_sif, get_rho),
+  tau     = sapply(nbs_sif, get_tau),
+  beta_w  = sapply(nbs_sif, gf, "beta_hat", idx = 2),
+  mean_SE = sapply(nbs_sif, function(x) mean(x$posterior_se, na.rm = TRUE))
+)
+
+kable(tab_nb_sif,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "SIF posterior summaries across neighbourhood weight specifications. All models include the water proportion covariate, RSR constraint, and R^-1 weighting.",
+  col.names = c("Neighbourhood", "rho", "tau",
+                "beta_water", "Mean SE"))
+```
+
+\newpage
+
+# Restricted Spatial Regression {#sec:rsr}
+
+Spatial confounding arises when both the covariate and the spatial random
+effect can explain the same variation in the response, leading to unstable
+covariate estimates. In our application, water proportion is the covariate
+of interest, and the land--water boundary creates a sharp spatial contrast
+that both the covariate and the SAR random effect can absorb. When the model
+is fit without any correction for this, the estimated water coefficient is
+positive (Table 5), which is implausible for two reasons: first, it is
+inconsistent with the SIF literature, which finds that water bodies have
+lower photosynthetic activity than vegetated land; and second, it contradicts
+the relationship observed at the coarse sounding scale, where the coefficient
+is approximately $-0.6$, suggesting water pixels have lower SIF than land
+pixels. A better approach should recover a result consistent with this
+coarse-scale relationship. Several approaches to handling the confounding
+are possible, each with drawbacks:
+
+\begin{itemize}
+  \item \textbf{Zeroing out water pixels entirely} would prevent the covariate
+    from fitting water, but OCO-2 soundings physically integrate over
+    mixed land--water footprints, so ignoring water would misrepresent
+    the forward model.
+  \item \textbf{Removing soundings over water} throws away potentially
+    useful observations and would leave portions of the target grid
+    unconstrained.
+  \item \textbf{Restricting neighbourhood communication across the
+    land--water boundary} (Section 3) reduces spatial smoothing across
+    the boundary but does not resolve the covariate--residual competition,
+    and is sensitive to how the boundary is defined given that water
+    proportion is continuous.
+  \item \textbf{Zeroing the residual over water pixels while allowing
+    a covariate fit} is conceptually close to RSR in spirit but harder
+    to implement cleanly and introduces additional modelling decisions
+    about which pixels to constrain.
+\end{itemize}
+
+We use restricted spatial regression (RSR), which orthogonalises the spatial
+residual against the covariate space so that $\hat\beta$ is identified by
+covariate variation alone. We note that RSR is not without controversy:
+it can introduce bias in the covariate estimate when the true data-generating
+process does not respect the orthogonality constraint (Hodges \& Reich, 2010).
+In our setting we adopt it as a pragmatic design choice to prevent the
+spatial random effect from absorbing the land--water contrast, rather than
+as a general recommendation for spatial confounding problems.
+
+Table 5 illustrates the effect of RSR for SIF. Without
+any spatial random effect (OLS) or with an unconstrained spatial effect
+(naive), the estimated water coefficient is
+$\hat\beta_\text{water} = `r fmt4(gf(r$sif_naive,"beta_hat",idx=2))`$, which is
+positive — implying that water pixels have higher SIF than land pixels, a
+physically implausible result. Applying RSR reverses the sign:
+$\hat\beta_\text{water} = `r fmt4(gf(r$sif,"beta_hat",idx=2))`$, consistent with
+water having lower photosynthetic activity than vegetated land. This sign
+reversal suggests that without RSR the spatial random effect absorbs much
+of the land--water contrast, leaving the covariate to explain residual
+variation that is spuriously positive, though we acknowledge this
+interpretation depends on the assumption that the orthogonality constraint
+is approximately appropriate.
+
+For albedo, where the ground truth is known, RSR also improves $R^2$ and
+coverage (Table 2 in the main paper), providing empirical support that the
+constraint produces better-calibrated uncertainty estimates as well as more
+physically interpretable coefficients in this application.
+
+```{r rsr_sif}
+rsrs <- list(r$sif_naive, r$sif_rsr_rho1, r$sif)
+
+tab_rsr <- data.frame(
+  Model    = c("Naive (no RSR)",
+               "RSR, rho=1",
+               "RSR, rho tuned (canonical)"),
+  rho      = sapply(rsrs, get_rho),
+  tau      = sapply(rsrs, get_tau),
+  beta_int = sapply(rsrs, gf, "beta_hat", idx = 1),
+  beta_w   = sapply(rsrs, gf, "beta_hat", idx = 2),
+  mean_SE  = sapply(rsrs, function(x) mean(x$posterior_se, na.rm = TRUE))
+)
+
+kable(tab_rsr,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "SIF posterior summaries with and without RSR. The naive model (no RSR) estimates a positive water coefficient, which is physically implausible. RSR corrects the sign and produces stable estimates across rho specifications.",
+  col.names = c("Model", "rho", "tau",
+                "beta_0", "beta_water",
+                "Mean SE"))
+```
+
+\newpage
+
+# Model Diagnostics {#sec:diagnostics}
+
+We compute standardized prediction residuals for the canonical SIF fit:
+
+$$r_i = \frac{y_i - \hat{y}_i}{\sqrt{\widehat{\text{Var}}(y_i - \hat{y}_i)}}$$
+
+where $\hat{y}_i = A_i \hat\mu$ is the fitted value and the predictive
+variance combines posterior uncertainty in the fitted value with
+per-sounding observation noise:
+
+$$\widehat{\text{Var}}(y_i - \hat{y}_i) = \hat\sigma^2_e \left(A_i K^{-1} A_i^\top + [R^{-1}]_{ii}^{-1}\right)$$
+
+
+```{r residual_diagnostic, fig.cap="Spatial residual diagnostic for the canonical SIF fit. Panel A: standardized prediction residuals mapped at sounding centroids; no spatial clustering is expected under correct specification. Panel B: standardized residual versus predictive SD; a flat loess indicates no heteroskedastic misspecification. Panel C: empirical variogram of standardized residuals with fitted exponential model (red); the dashed line marks the expected sill of 1 under no autocorrelation. Panel D: Q-Q plot against $N(0,1)$.", fig.height=7, fig.width=9}
+
+diag <- .pkg_get("results_diagnostic_residuals")
+
+df_resid <- data.frame(
+  x         = diag$coords$x,
+  y         = diag$coords$y,
+  std_resid = diag$std_resid,
+  pred_sd   = diag$pred_sd
+)
+
+clamp <- function(x, lo = -3.5, hi = 3.5) pmax(pmin(x, hi), lo)
+
+p_map <- ggplot(df_resid, aes(x = x, y = y, colour = clamp(std_resid))) +
+  geom_point(size = 0.9, alpha = 0.75) +
+  scale_colour_distiller(palette = "RdBu", limits = c(-3.5, 3.5),
+                         name = "Std.\nresid.\n(±3.5)") +
+  coord_equal() +
+  labs(title = "A: Standardized residuals",
+       x = "Easting (m)", y = "Northing (m)") +
+  theme_bw(base_size = 9) +
+  theme(axis.text = element_text(size = 7))
+
+p_sd <- ggplot(df_resid, aes(x = pred_sd, y = std_resid)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  geom_hline(yintercept = c(-2, 0, 2),
+             linetype = c("dashed", "solid", "dashed"),
+             colour = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE,
+              colour = "tomato", linewidth = 0.8) +
+  labs(title = "B: Std. residual vs. predictive SD",
+       x = "Predictive SD", y = "Std. residual") +
+  theme_bw(base_size = 9)
+
+p_vgm <- ggplot(diag$vgm_emp, aes(x = dist, y = gamma)) +
+  geom_point(aes(size = np), colour = "grey30") +
+  scale_size_continuous(name = "Pairs", range = c(1, 3)) +
+  geom_hline(yintercept = 1, linetype = "dashed",
+             colour = "steelblue", linewidth = 0.8) +
+  labs(title = "C: Variogram of std. residuals",
+       x = "Distance (m)", y = "Semivariance") +
+  theme_bw(base_size = 9)
+
+if (!is.null(diag$vgm_fit)) {
+  max_dist  <- max(diag$vgm_emp$dist)
+  vgm_line  <- gstat::variogramLine(diag$vgm_fit, maxdist = max_dist, n = 200L)
+  p_vgm <- p_vgm +
+    geom_line(data = vgm_line, aes(x = dist, y = gamma),
+              colour = "tomato", linewidth = 0.8, inherit.aes = FALSE)
+}
+
+p_qq <- ggplot(df_resid, aes(sample = std_resid)) +
+  stat_qq(alpha = 0.3, size = 0.6) +
+  stat_qq_line(colour = "tomato", linewidth = 0.8) +
+  labs(title = "D: Q-Q plot",
+       x = "Theoretical quantiles", y = "Sample quantiles") +
+  theme_bw(base_size = 9)
+
+(p_map | p_sd) / (p_vgm | p_qq)
+```
+
+The figure above shows the four diagnostic panels. The standardized residuals have
+mean `r fmt3(diag$resid_mean)` and standard deviation `r fmt3(diag$resid_sd)`
+(both close to their expected values of 0 and 1 respectively), and
+`r sprintf("%.1f%%", 100 * diag$pct_gt2)` exceed $\pm 2$ in absolute value
+(expected 5% under normality). The Q-Q plot shows approximate normality with
+mild heavy tails, consistent with the heterogeneous observation density across
+soundings. Panel B shows no systematic relationship between residual magnitude
+and predictive uncertainty, indicating no heteroskedastic misspecification.
+The empirical variogram is flat across all lag distances with a sill near 1,
+confirming no residual spatial autocorrelation. Together these diagnostics
+support the model specification and confirm that the SAR prior adequately
+absorbs the spatial structure in the data.
+
+\newpage
+
+# Forward Operator Sensitivity {#sec:forward_operator}
+
+The aggregation matrix $A$ discretises the continuous change-of-support
+integral by replacing each intersection integral with a weighted average
+over the intersecting latent cell. The default specification uses uniform
+weights within each intersection ($g_i \equiv 1$). Here we assess sensitivity
+to this choice by considering a family of super-Gaussian sensor response
+functions parameterised by a width $\tau$.
+
+**Sensor response function.** For sounding $i$ with centroid $c_i$ and
+affine map $M_i^{-1}$ transforming footprint coordinates to a canonical
+unit square, the response function is:
+$$g_i(s) = \exp\!\left(-\frac{\|M_i^{-1}(s - c_i)\|^2}{2\tau^2}\right)$$
+As $\tau \to \infty$ the response approaches uniform ($g_i \equiv 1$,
+the default). As $\tau \to 0$ the response concentrates at the footprint
+centre, approaching the centroid approximation in the limit.
+The aggregation weight for cell $j$ under sounding $i$ is then
+$a_{ij} \propto \int_{D_i^{(o)} \cap D_j^{(\ell)}} g_i(s)\,ds$,
+normalised so that $\sum_j a_{ij} = 1$. Each intersection integral is
+evaluated numerically by triangulating the intersection polygon and
+applying quasi-Monte Carlo quadrature within each triangle.
+
+Figure 4 shows $g_i$ evaluated on a representative rectangular
+OCO-2 footprint for each $\tau$ value considered. The five tau values tested
+span from nearly uniform ($\tau=0.5$) to sharply peaked ($\tau=0.01$).
+
+```{r gA_viz, fig.cap="Super-Gaussian sensor response $g_i(s)$ evaluated on a representative OCO-2 footprint for each $\\tau$ value. Uniform ($\\tau = \\infty$, top left) assigns equal weight everywhere; smaller $\\tau$ concentrates weight at the footprint centre. The centroid approximation (bottom right) is the limiting case.", fig.height=4, fig.width=9}
+
+nx <- 60; ny <- 40
+xs <- seq(-1, 1, length.out = nx)
+ys <- seq(-1, 1, length.out = ny)
+grid_uv <- expand.grid(u = xs, v = ys)
+
+tau_vals_viz <- c(Inf, 0.5, 1/3, 0.2, 0.1, 0.01)
+tau_labs     <- c("Uniform (tau=inf)", "tau=0.5", "tau=0.33",
+                  "tau=0.2",           "tau=0.1", "tau=0.01 (centroid)")
+
+df_g <- do.call(rbind, lapply(seq_along(tau_vals_viz), function(k) {
+  tau <- tau_vals_viz[k]
+  g   <- if (is.infinite(tau)) rep(1, nrow(grid_uv)) else
+           exp(-(grid_uv$u^2 + grid_uv$v^2) / (2 * tau^2))
+  data.frame(u     = grid_uv$u,
+             v     = grid_uv$v,
+             g     = g / max(g),
+             label = tau_labs[k])
+}))
+df_g$label <- factor(df_g$label, levels = tau_labs)
+
+ggplot(df_g, aes(x = u, y = v, fill = g)) +
+  geom_tile() +
+  facet_wrap(~ label, nrow = 2) +
+  scale_fill_gradient(low = "white", high = "tomato",
+                      name = expression(g[i](s)~"(normalised)")) +
+  coord_equal() +
+  labs(x = "Footprint u-coordinate",
+       y = "Footprint v-coordinate") +
+  theme_minimal(base_size = 9) +
+  theme(legend.position  = "bottom",
+        panel.grid       = element_blank(),
+        strip.text       = element_text(size = 8))
+```
+
+## Albedo validation
+
+Because the albedo data has a known generating field, we can directly assess
+the impact of forward operator misspecification on RMSE and coverage.
+Figure 5 and Table 6 show results for
+albedo as $\tau$ decreases from 0.5 (broad response, close to uniform) to
+the centroid limit. Coverage degrades monotonically from
+`r pct(gf(r$water_rsr_cv,"coverage_95_obs"))` at the uniform baseline to
+`r pct(gf(r$alb_gA_cent,"coverage_95_obs"))` at the centroid limit, while
+RMSE increases by
+`r fmt4(gf(r$alb_gA_cent,"rmse") - gf(r$water_rsr_cv,"rmse"))` absolute
+units. This confirms that forward operator misspecification primarily damages
+uncertainty quantification rather than point prediction accuracy.
+
+```{r gA_albedo, fig.cap="Coverage (95\\%) and RMSE as functions of the sensor response width $\\tau$ for the albedo validation experiment. The uniform baseline ($\\tau = \\infty$, leftmost point) achieves near-nominal coverage; coverage degrades monotonically as $\\tau \\to 0$ (centroid limit, rightmost point).", fig.height=3.5, fig.width=7}
+
+tau_vals  <- c(Inf, 0.5, 1/3, 0.2, 0.1, 0)
+cov_vals  <- c(gf(r$water_rsr_cv, "coverage_95_obs"),
+               gf(r$alb_gA_tau05,  "coverage_95_obs"),
+               gf(r$alb_gA_tau033, "coverage_95_obs"),
+               gf(r$alb_gA_tau02,  "coverage_95_obs"),
+               gf(r$alb_gA_tau01,  "coverage_95_obs"),
+               gf(r$alb_gA_cent,   "coverage_95_obs"))
+rmse_vals <- c(gf(r$water_rsr_cv, "rmse"),
+               gf(r$alb_gA_tau05,  "rmse"),
+               gf(r$alb_gA_tau033, "rmse"),
+               gf(r$alb_gA_tau02,  "rmse"),
+               gf(r$alb_gA_tau01,  "rmse"),
+               gf(r$alb_gA_cent,   "rmse"))
+
+tau_labels <- c("Uniform\n(baseline)", "0.5", "0.33", "0.2", "0.1", "Centroid")
+df_gA <- data.frame(
+  tau      = factor(tau_labels, levels = tau_labels),
+  coverage = cov_vals,
+  rmse     = rmse_vals
+)
+
+p_cov <- ggplot(df_gA, aes(x = tau, y = coverage, group = 1)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "gray50") +
+  geom_line(color = "steelblue", linewidth = 0.9) +
+  geom_point(color = "steelblue", size = 2.5) +
+  scale_y_continuous(limits = c(0.5, 1.0),
+                     labels = scales::percent_format(accuracy = 1)) +
+  labs(x = expression(tau), y = "Coverage (95%)") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank())
+
+p_rmse <- ggplot(df_gA, aes(x = tau, y = rmse, group = 1)) +
+  geom_line(color = "tomato", linewidth = 0.9) +
+  geom_point(color = "tomato", size = 2.5) +
+  labs(x = expression(tau), y = "RMSE") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank())
+
+p_cov | p_rmse
+```
+
+```{r gA_albedo_table}
+gAs_alb <- list(r$water_rsr_cv, r$alb_gA_tau05, r$alb_gA_tau033,
+                r$alb_gA_tau02, r$alb_gA_tau01, r$alb_gA_cent)
+
+tab_gA_alb <- data.frame(
+  tau_sens = c("Uniform (baseline)", "0.5", "0.33", "0.2", "0.1", "Centroid"),
+  rho      = sapply(gAs_alb, get_rho),
+  tau      = sapply(gAs_alb, get_tau),
+  RMSE     = rmse_vals,
+  R2       = sapply(gAs_alb, gf, "r2"),
+  Coverage = cov_vals
+)
+
+kable(tab_gA_alb,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "Albedo predictive performance under forward operator misspecification. The sensor response width tau controls the width of the super-Gaussian sensor response function; tau -> 0 corresponds to the centroid approximation. Coverage degrades monotonically while RMSE increases modestly.",
+  col.names = c("Sensor tau", "rho", "tau (smoothing)",
+                "RMSE", "R2", "Coverage (95%)"))
+```
+
+\newpage
+
+## SIF sensitivity
+
+For SIF, ground truth is unavailable, so we assess sensitivity through
+changes in posterior mean and uncertainty. The table below shows
+that as the sensor response $\tau$ decreases, $\hat\rho$ increases toward 1 and the
+smoothing $\tau$ decreases, reflecting the model compensating for a more peaked forward
+operator by increasing spatial smoothness. The water coefficient
+$\hat\beta_\text{water}$ remains stable across all specifications
+(range: `r fmt4(min(sapply(list(r$sif, r$sif_gA_tau05, r$sif_gA_tau033, r$sif_gA_tau02, r$sif_gA_tau01, r$sif_gA_tau001), gf, "beta_hat", idx=2)))`
+to
+`r fmt4(max(sapply(list(r$sif, r$sif_gA_tau05, r$sif_gA_tau033, r$sif_gA_tau02, r$sif_gA_tau01, r$sif_gA_tau001), gf, "beta_hat", idx=2)))`),
+suggesting that the posterior mean is robust to the exact form of the sensor
+response function even as uncertainty estimates vary.
+
+```{r gA_sif}
+gAs_sif <- list(r$sif, r$sif_gA_tau05, r$sif_gA_tau033,
+                r$sif_gA_tau02, r$sif_gA_tau01, r$sif_gA_tau001)
+
+tab_gA_sif <- data.frame(
+  tau_sens = c("Uniform (baseline)", "0.5", "0.33", "0.2", "0.1", "0.01"),
+  rho      = sapply(gAs_sif, get_rho),
+  tau      = sapply(gAs_sif, get_tau),
+  beta_w   = sapply(gAs_sif, gf, "beta_hat", idx = 2),
+  mean_SE  = sapply(gAs_sif, function(x) mean(x$posterior_se, na.rm = TRUE))
+)
+
+kable(tab_gA_sif,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "SIF posterior summaries under forward operator misspecification. The water coefficient is stable across all specifications; mean posterior SE increases as sensor tau -> 0 reflecting decreased smoothing.",
+  col.names = c("Sensor tau", "rho", "tau (smoothing)",
+                "beta_water", "Mean SE"))
+```
+
+## Kriging comparison
+
+**Kriging setup.** We fit universal kriging with the water proportion as a
+covariate, using the model $y(s) = \beta_0 + \beta_1 w(s) + \varepsilon(s)$
+where $\varepsilon$ is a zero-mean stationary Gaussian process. Observations
+are treated as **point support at sounding centroids** — the standard
+geostatistical assumption that ignores the areal nature of the footprints.
+An exponential variogram model is fitted empirically to the sounding-level
+residuals (cutoff 15 km, bin width 500 m), and universal kriging predictions
+are made at the 330 m target grid cell centroids.
+
+The fitted variogram parameters for albedo are nugget =
+`r fmt4(r$krig_alb$vgm_fit$psill[1])`,
+partial sill = `r fmt4(r$krig_alb$vgm_fit$psill[2])`,
+range = `r fmt1(r$krig_alb$vgm_fit$range[2])` m.
+
+```{r kriging_variogram, fig.cap="Empirical variogram (points) and fitted exponential model (line) for the semi-synthetic albedo data. The nugget reflects measurement error; the range indicates the spatial scale of correlation.", fig.height=3, fig.width=5}
+
+vgm_emp <- r$krig_alb$vgm_emp
+vgm_fit <- r$krig_alb$vgm_fit
+
+lag_seq  <- seq(0, max(vgm_emp$dist) * 1.05, length.out = 200)
+nugget   <- vgm_fit$psill[1]
+psill    <- vgm_fit$psill[2]
+range_   <- vgm_fit$range[2]
+vgm_line <- data.frame(
+  dist  = lag_seq,
+  gamma = nugget + psill * (1 - exp(-lag_seq / range_))
+)
+
+ggplot() +
+  geom_line(data  = vgm_line,
+            aes(x = dist / 1000, y = gamma),
+            color = "steelblue", linewidth = 0.9) +
+  geom_point(data  = vgm_emp,
+             aes(x = dist / 1000, y = gamma, size = np),
+             color = "grey30", alpha = 0.7) +
+  scale_size_continuous(name = "n pairs", range = c(1, 4)) +
+  labs(x     = "Lag distance (km)",
+       y     = expression(hat(gamma)(h)~"(semivariance)"),
+       title = "Albedo empirical variogram") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position  = "right")
+```
+
+The Bayesian approach achieves substantially better coverage
+(`r pct(gf(r$water_rsr_cv,"coverage_95_obs"))` vs.\
+`r pct(gf(r$krig_alb,"coverage_95_obs"))`) with similar RMSE. The coverage
+gap arises because kriging treats each observation as a point, so its
+prediction variance reflects interpolation uncertainty but not the
+change-of-support uncertainty from aggregating an areal field — leading to
+intervals that are systematically too narrow (Goovaerts, 2008).
+
+```{r kriging_table}
+krigs <- list(r$water_rsr_cv, r$alb_gA_cent, r$krig_alb)
+
+tab_krig <- data.frame(
+  Method   = c("Bayesian (uniform A, baseline)",
+               "Bayesian (centroid A)",
+               "Universal kriging"),
+  RMSE     = sapply(krigs, gf, "rmse"),
+  R2       = sapply(krigs, gf, "r2"),
+  Coverage = sapply(krigs, gf, "coverage_95_obs")
+)
+
+kable(tab_krig,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "Comparison of Bayesian downscaling and universal kriging on the albedo validation experiment. The centroid approximation row shows performance when the aggregation matrix uses footprint centroids rather than intersection areas. Kriging coverage is substantially below nominal; the Bayesian approach with correct change-of-support aggregation achieves near-nominal coverage.",
+  col.names = c("Method", "RMSE", "R2", "Coverage (95%)"))
+```
+
+## Forward operator misspecification experiment
+
+To assess whether the choice of $A$ matters in practice, we conduct a
+controlled 2x2 experiment. We generate two sets of synthetic
+observations from the known albedo field: one using the uniform aggregation
+matrix ($A_\text{unif}$) and one using the $g$-weighted matrix with
+$\tau = 1/3$ ($A_g$). We then fit the model under each $A$ specification
+to each dataset, giving four combinations. If forward operator
+misspecification is consequential, the off-diagonal cells (misspecified
+fitting $A$) should perform worse than the diagonal cells (correctly
+specified).
+
+The table below shows RMSE and $R^2$ for all four combinations.
+The diagonal entries outperform the corresponding off-diagonal entries in
+both cases, confirming that misspecification is detectable. The effect is
+asymmetric: generating with $A_g$ and fitting with $A_\text{unif}$ incurs a
+larger RMSE penalty than the reverse, suggesting that over-smoothing the
+forward operator (uniform $A$ applied to data generated with a peaked $g$)
+is more harmful than under-smoothing. However, all four cells achieve $R^2 >
+0.70$, so the absolute magnitude of the effect is modest relative to the
+overall predictive performance — consistent with the tau sensitivity results
+above.
+
+```{r contingency_table}
+ct_uu <- r$ct_uu
+ct_ug <- r$ct_ug
+ct_gu <- r$ct_gu
+ct_gg <- r$ct_gg
+
+tab_ct <- data.frame(
+  gen  = c("Uniform", "Uniform", "g-weighted", "g-weighted"),
+  fit  = c("Uniform", "g-weighted", "Uniform", "g-weighted"),
+  rmse = c(gf(ct_uu,"rmse"), gf(ct_ug,"rmse"),
+           gf(ct_gu,"rmse"), gf(ct_gg,"rmse")),
+  r2   = c(gf(ct_uu,"r2"),   gf(ct_ug,"r2"),
+           gf(ct_gu,"r2"),   gf(ct_gg,"r2")),
+  tau  = c(get_tau(ct_uu),   get_tau(ct_ug),
+           get_tau(ct_gu),   get_tau(ct_gg))
+)
+
+kable(tab_ct,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "2x2 misspecification experiment: RMSE and R2 for each combination of data-generating A (rows) and fitting A (columns). Diagonal entries are correctly specified; off-diagonal entries are misspecified. The diagonal outperforms in both cases, with the gen=g/fit=uniform cell showing the largest penalty.",
+  col.names = c("Generating A", "Fitting A", "RMSE", "R2", "tau"))
+```
+
+```{r contingency_maps, fig.cap="Posterior mean albedo maps for the 2x2 misspecification experiment. Rows correspond to the data-generating A (uniform, top; g-weighted, bottom); columns to the fitting A (uniform, left; g-weighted, right). Diagonal panels are correctly specified. Spatial patterns are broadly similar across all four cells; differences are most visible at footprint boundaries in the off-diagonal panels.", fig.height=6, fig.width=9}
+
+covered <- ct_uu$covered
+tg_sf   <- goebel2026::target_grid[covered, ]
+
+# Shared colour scale across all four panels
+ct_shared_lims <- range(
+  c(ct_uu$posterior_mean[covered], ct_ug$posterior_mean[covered],
+    ct_gu$posterior_mean[covered], ct_gg$posterior_mean[covered]),
+  na.rm = TRUE
+)
+
+make_ct_map <- function(ct, title_str) {
+  tg_sf$val <- ct$posterior_mean[covered]
+  ggplot(tg_sf) +
+    geom_sf(aes(fill = val), color = NA) +
+    scale_fill_viridis_c(name = "Albedo",
+                         limits = ct_shared_lims,
+                         option = "magma") +
+    labs(title    = title_str,
+         subtitle = sprintf("RMSE=%.4f  R2=%.3f", ct$rmse, ct$r2)) +
+    theme_void(base_size = 9) +
+    theme(legend.position = "right")
+}
+
+p_uu <- make_ct_map(ct_uu, "Gen: Uniform    | Fit: Uniform")
+p_ug <- make_ct_map(ct_ug, "Gen: Uniform    | Fit: g-weighted")
+p_gu <- make_ct_map(ct_gu, "Gen: g-weighted | Fit: Uniform")
+p_gg <- make_ct_map(ct_gg, "Gen: g-weighted | Fit: g-weighted")
+
+(p_uu | p_ug) / (p_gu | p_gg)
+```
+
+\newpage
+
+# Rho Sensitivity {#sec:rho}
+
+The SAR spatial range parameter $\rho$ controls the decay of spatial
+correlation: $\rho = 1$ corresponds to an intrinsic (improper) prior with
+no decay, while smaller values introduce exponential decay in correlations
+with distance. In the main analysis we tune $\rho$ jointly with $\tau$ via
+cross-validation.
+
+The table below shows albedo results at $\rho = 1$ (intrinsic)
+and at the CV-tuned value $\hat\rho =
+`r fmt3(get_rho(r$water_rsr_cv))`$. The differences in RMSE, $R^2$, and
+coverage are small (less than 1 percentage point in coverage), confirming
+that the intrinsic prior is a reasonable default. We nevertheless prefer
+the tuned $\rho$ in the main analysis as it provides marginally better
+coverage calibration. For SIF, the canonical model uses
+$\hat\rho = `r fmt3(get_rho(r$sif))`$; fixing $\rho = 0.95$ gives
+essentially identical posterior means and $\hat\beta_\text{water}$ values
+(Table 8 in the main results summary).
+
+```{r rho_sensitivity}
+rhos <- list(r$water_rsr, r$water_rsr_cv, r$water, r$water_rho_cv)
+
+tab_rho <- data.frame(
+  Model    = c("Water + RSR, rho=1",
+               "Water + RSR, rho tuned",
+               "Water (no RSR), rho=1",
+               "Water (no RSR), rho tuned"),
+  rho      = sapply(rhos, get_rho),
+  tau      = sapply(rhos, get_tau),
+  RMSE     = sapply(rhos, gf, "rmse"),
+  R2       = sapply(rhos, gf, "r2"),
+  Coverage = sapply(rhos, gf, "coverage_95_obs")
+)
+
+kable(tab_rho,
+  format    = "pipe",
+  digits    = 4,
+  caption   = "Albedo predictive performance at fixed rho=1 versus CV-tuned rho, with and without RSR. Differences are small in all metrics, confirming that the intrinsic prior (rho=1) is a reasonable default.",
+  col.names = c("Model", "rho", "tau",
+                "RMSE", "R2", "Coverage (95%)"))
+```
